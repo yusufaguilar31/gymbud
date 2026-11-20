@@ -69,11 +69,13 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   });
 
   let data: any = null;
+  let invalidJsonResponse = false;
   const text = await res.text();
   if (text) {
     try {
       data = JSON.parse(text);
     } catch {
+      invalidJsonResponse = true;
       const trimmed = text.trim();
       const isHtmlOrEdgeNotFound =
         trimmed.startsWith('<!') ||
@@ -91,7 +93,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     }
   }
 
-  if (!res.ok) {
+  if (!res.ok || invalidJsonResponse) {
     if (
       res.status === 401 &&
       !path.startsWith('/api/auth/login') &&

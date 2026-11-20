@@ -121,6 +121,35 @@ function clearSessionCookie(req: express.Request, res: express.Response) {
 }
 
 export function registerRoutes(app: Express, hub: RealtimeHub): void {
+  // Optional CORS support when frontend (e.g. Vercel) connects to a separate backend via VITE_API_BASE_URL
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      const configuredCors = (process.env.CORS_ORIGIN || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const isAllowed =
+        configuredCors.includes(origin) ||
+        origin === process.env.APP_URL ||
+        /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin) ||
+        /^https:\/\/[a-z0-9-]+\.run\.app$/i.test(origin) ||
+        /^http:\/\/localhost:\d+$/i.test(origin);
+      if (isAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      }
+    }
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   // Serve uploaded user avatars safely (prevent XSS by forcing image content types & nosniff)
   app.use('/api/uploads', express.static(uploadsDir, {
     setHeaders: (res) => {
@@ -354,29 +383,40 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   // 1. AUTHENTICATION & REGISTRATION
   // ==========================================
   app.post('/api/auth/register', rateLimit('auth_register', 10, 60_000), (req, res) => {
+    if (!req.body || typeof req.body !== 'object') {
+      res.status(400).json({ error: 'Invalid registration payload.' });
+      return;
+    }
+
     const email = sanitizeText(req.body?.email, 160).toLowerCase();
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
     const displayName = sanitizeText(req.body?.display_name, 80);
     const phone = sanitizeText(req.body?.phone, 32);
-    const age = Number(req.body?.age);
+    const rawAge =
+      typeof req.body?.age === 'number'
+        ? String(req.body.age)
+        : typeof req.body?.age === 'string'
+          ? req.body.age.trim()
+          : '';
+    const age = /^\d{2}$/.test(rawAge) ? Number(rawAge) : NaN;
     const gender = sanitizeText(req.body?.gender, 40) || 'Prefer not to say';
     const city = sanitizeText(req.body?.city, 60) || 'Abu Dhabi';
     const country = sanitizeText(req.body?.country, 60) || 'UAE';
 
+    if (!displayName || displayName.length < 2) {
+      res.status(400).json({ error: 'Please enter a display name (at least 2 characters).' });
+      return;
+    }
+    if (!Number.isInteger(age) || age < 18 || age > 99) {
+      res.status(400).json({ error: 'Age must be a 2-digit number between 18 and 99.' });
+      return;
+    }
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       res.status(400).json({ error: 'Please enter a valid email address.' });
       return;
     }
     if (password.length < 8) {
       res.status(400).json({ error: 'Password must be at least 8 characters long.' });
-      return;
-    }
-    if (!displayName || displayName.length < 2) {
-      res.status(400).json({ error: 'Please enter your display name.' });
-      return;
-    }
-    if (!Number.isFinite(age) || age < 18 || age > 100) {
-      res.status(400).json({ error: 'You must be at least 18 years old to join GYMBUD.' });
       return;
     }
 
@@ -409,55 +449,80 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     const ownerAdminEmail = (process.env.ADMIN_OWNER_EMAIL || 'yusufaguilar2008@gmail.com').trim().toLowerCase();
     const assignedRole: 'member' | 'admin' = email === ownerAdminEmail ? 'admin' : 'member';
 
-    const tx = db.transaction(() => {
-      db.prepare(
-        `INSERT INTO users (id, email, phone, password_hash, role, duplicate_fingerprint, suspicious_score)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(userId, email, phone, passwordHash, assignedRole, fingerprint, suspiciousScore);
+    try {
+      const tx = db.transaction(() => {
+        db.prepare(
+          `INSERT INTO users (id, email, phone, password_hash, role, duplicate_fingerprint, suspicious_score)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(userId, email, phone, passwordHash, assignedRole, fingerprint, suspiciousScore);
 
-      db.prepare(
-        `INSERT INTO profiles (user_id, display_name, age, gender, city, country, avatar_url, onboarding_completed)
-         VALUES (?, ?, ?, ?, ?, ?, '', 0)`
-      ).run(userId, displayName, Math.floor(age), gender, city, country);
+        db.prepare(
+          `INSERT INTO profiles (user_id, display_name, age, gender, city, country, avatar_url, onboarding_completed)
+           VALUES (?, ?, ?, ?, ?, ?, '', 0)`
+        ).run(userId, displayName, age, gender, city, country);
 
-      db.prepare(`INSERT INTO fitness_preferences (user_id) VALUES (?)`).run(userId);
-      db.prepare(`INSERT INTO notification_preferences (user_id) VALUES (?)`).run(userId);
-      if (assignedRole === 'admin') {
-        db.prepare(`INSERT INTO admin_roles (user_id, role_name, granted_by) VALUES (?, 'Owner Admin', 'system')`).run(
-          userId
-        );
+        db.prepare(`INSERT INTO fitness_preferences (user_id) VALUES (?)`).run(userId);
+        db.prepare(`INSERT INTO notification_preferences (user_id) VALUES (?)`).run(userId);
+        if (assignedRole === 'admin') {
+          db.prepare(`INSERT INTO admin_roles (user_id, role_name, granted_by) VALUES (?, 'Owner Admin', 'system')`).run(
+            userId
+          );
+        }
+      });
+      tx();
+
+      const token = signSessionToken(userId, assignedRole);
+      setSessionCookie(req, res, token);
+
+      res.status(201).json({ user: getFullCurrentUser(userId), session_token: token });
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.includes('UNIQUE') && msg.includes('users.email')) {
+        res.status(409).json({ error: 'An account with this email already exists.' });
+        return;
       }
-    });
-    tx();
-
-    const token = signSessionToken(userId, assignedRole);
-    setSessionCookie(req, res, token);
-
-    res.status(201).json({ user: getFullCurrentUser(userId), session_token: token });
+      console.error('[Register Error]', err);
+      res.status(500).json({ error: 'Unable to create account right now. Please try again.' });
+    }
   });
 
   app.post('/api/auth/login', rateLimit('auth_login', 20, 60_000), (req, res) => {
+    if (!req.body || typeof req.body !== 'object') {
+      res.status(400).json({ error: 'Invalid login payload.' });
+      return;
+    }
+
     const email = sanitizeText(req.body?.email, 160).toLowerCase();
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
 
-    const userRow = db
-      .prepare(`SELECT id, password_hash, role, account_status FROM users WHERE email = ?`)
-      .get(email) as { id: string; password_hash: string; role: 'member' | 'moderator' | 'admin'; account_status: string } | undefined;
-
-    if (!userRow || !verifyPassword(password, userRow.password_hash)) {
-      res.status(401).json({ error: 'Invalid email or password.' });
+    if (!email || !password) {
+      res.status(400).json({ error: 'Please enter both email and password.' });
       return;
     }
 
-    if (userRow.account_status === 'suspended' || userRow.account_status === 'banned' || userRow.account_status === 'deleted') {
-      res.status(403).json({ error: `Your account is ${userRow.account_status}. Please contact GYMBUD Safety.` });
-      return;
+    try {
+      const userRow = db
+        .prepare(`SELECT id, password_hash, role, account_status FROM users WHERE email = ?`)
+        .get(email) as { id: string; password_hash: string; role: 'member' | 'moderator' | 'admin'; account_status: string } | undefined;
+
+      if (!userRow || !verifyPassword(password, userRow.password_hash)) {
+        res.status(401).json({ error: 'Invalid email or password.' });
+        return;
+      }
+
+      if (userRow.account_status === 'suspended' || userRow.account_status === 'banned' || userRow.account_status === 'deleted') {
+        res.status(403).json({ error: `Your account is ${userRow.account_status}. Please contact GYMBUD Safety.` });
+        return;
+      }
+
+      const token = signSessionToken(userRow.id, userRow.role);
+      setSessionCookie(req, res, token);
+
+      res.json({ user: getFullCurrentUser(userRow.id), session_token: token });
+    } catch (err) {
+      console.error('[Login Error]', err);
+      res.status(500).json({ error: 'Unable to sign in right now. Please try again.' });
     }
-
-    const token = signSessionToken(userRow.id, userRow.role);
-    setSessionCookie(req, res, token);
-
-    res.json({ user: getFullCurrentUser(userRow.id), session_token: token });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -763,8 +828,8 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       }
 
       const age = body.age !== undefined ? Number(body.age) : current.age;
-      if (!Number.isFinite(age) || age < 18 || age > 100) {
-        res.status(400).json({ error: 'Age must be 18 or older.' });
+      if (!Number.isInteger(age) || age < 18 || age > 99) {
+        res.status(400).json({ error: 'Age must be a 2-digit number between 18 and 99.' });
         return;
       }
 
@@ -2605,5 +2670,19 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     tx();
 
     res.json({ ok: true });
+  });
+
+  // Always return structured JSON on unhandled /api errors or malformed JSON payloads
+  app.use('/api', (err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    if (err?.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+      res.status(400).json({ error: 'Invalid JSON request payload.' });
+      return;
+    }
+    console.error('[API Error]', err);
+    res.status(err?.status || 500).json({ error: err?.message || 'Internal server error.' });
   });
 }

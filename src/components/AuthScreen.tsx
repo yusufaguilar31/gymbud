@@ -55,6 +55,13 @@ export function AuthScreen({
   const [error, setError] = useState<string | null>(null);
   const [showTestAccounts, setShowTestAccounts] = useState(false);
 
+  // Sync mode when parent updates initialMode unless URL reset token is active
+  useEffect(() => {
+    if (!initialResetToken) {
+      setMode(initialMode);
+    }
+  }, [initialMode, initialResetToken]);
+
   // Extract URL query reset token directly if present and scrub it from URL history
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -231,32 +238,65 @@ export function AuthScreen({
     setLoading(true);
     try {
       if (mode === 'login') {
-        const res = await api<{ user: CurrentUser; session_token?: string }>('/api/auth/login', {
-          method: 'POST',
-          body: JSON.stringify({ email, password }),
-        });
-        setSessionToken(res.session_token);
-        onAuthenticated(res.user);
-      } else if (mode === 'register') {
-        const parsedAge = Number(age);
-        if (!Number.isFinite(parsedAge) || parsedAge < 18) {
-          setError('You must be 18 or older to register on GYMBUD.');
+        const cleanEmail = email.trim().toLowerCase();
+        if (!cleanEmail || !password) {
+          setError('Please enter your email address and password.');
           setLoading(false);
           return;
         }
+        const res = await api<{ user: CurrentUser; session_token?: string }>('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ email: cleanEmail, password }),
+        });
+        if (!res?.user) {
+          throw new Error('Invalid login response from server.');
+        }
+        setSessionToken(res.session_token);
+        onAuthenticated(res.user);
+      } else if (mode === 'register') {
+        const cleanDisplayName = displayName.trim();
+        const cleanEmail = email.trim().toLowerCase();
+        const cleanPhone = phone.trim();
+        const cleanAge = age.trim();
+        const parsedAge = Number(cleanAge);
+
+        if (cleanDisplayName.length < 2) {
+          setError('Please enter a display name (at least 2 characters).');
+          setLoading(false);
+          return;
+        }
+        if (!/^\d{2}$/.test(cleanAge) || !Number.isInteger(parsedAge) || parsedAge < 18 || parsedAge > 99) {
+          setError('Age must be a 2-digit number between 18 and 99.');
+          setLoading(false);
+          return;
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+          setError('Please enter a valid email address.');
+          setLoading(false);
+          return;
+        }
+        if (password.length < 8) {
+          setError('Password must be at least 8 characters long.');
+          setLoading(false);
+          return;
+        }
+
         const res = await api<{ user: CurrentUser; session_token?: string }>('/api/auth/register', {
           method: 'POST',
           body: JSON.stringify({
-            email,
+            email: cleanEmail,
             password,
-            display_name: displayName,
-            phone,
+            display_name: cleanDisplayName,
+            phone: cleanPhone,
             age: parsedAge,
             gender,
             city,
             country,
           }),
         });
+        if (!res?.user) {
+          throw new Error('Invalid registration response from server.');
+        }
         setSessionToken(res.session_token);
         onAuthenticated(res.user);
       }
@@ -275,6 +315,9 @@ export function AuthScreen({
         method: 'POST',
         body: JSON.stringify({ email: seedEmail, password: 'Gymbud2026!' }),
       });
+      if (!res?.user) {
+        throw new Error('Invalid login response from server.');
+      }
       setSessionToken(res.session_token);
       onAuthenticated(res.user);
     } catch (err: any) {
@@ -442,16 +485,22 @@ export function AuthScreen({
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-medium text-zinc-300 mb-1.5">Age (18+ required)</label>
+                      <label className="block text-xs font-medium text-zinc-300 mb-1.5">Age (18–99)</label>
                       <input
-                        type="number"
-                        min={18}
-                        max={100}
+                        type="text"
+                        inputMode="numeric"
+                        pattern="\d{2}"
+                        maxLength={2}
                         required
                         value={age}
-                        onChange={(e) => setAge(e.target.value)}
+                        onChange={(e) => setAge(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                        placeholder="24"
+                        aria-invalid={age.length > 0 && (!/^\d{2}$/.test(age) || Number(age) < 18)}
                         className="w-full h-11 px-3.5 rounded-lg bg-[#070809] border border-white/15 text-sm text-white font-mono-num focus:outline-none focus:border-[#A3E635]"
                       />
+                      {age.length > 0 && (!/^\d{2}$/.test(age) || Number(age) < 18) && (
+                        <p className="mt-1 text-[11px] text-amber-400">Enter 2 digits (18–99)</p>
+                      )}
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-zinc-300 mb-1.5">Gender</label>
@@ -473,9 +522,16 @@ export function AuthScreen({
                       <select
                         value={city}
                         onChange={(e) => {
-                          setCity(e.target.value);
-                          if (['Abu Dhabi', 'Dubai', 'Sharjah', 'Al Ain'].includes(e.target.value)) {
+                          const nextCity = e.target.value;
+                          setCity(nextCity);
+                          if (['Abu Dhabi', 'Dubai', 'Sharjah', 'Al Ain'].includes(nextCity)) {
                             setCountry('UAE');
+                          } else if (nextCity === 'Riyadh') {
+                            setCountry('Saudi Arabia');
+                          } else if (nextCity === 'London') {
+                            setCountry('UK');
+                          } else if (nextCity === 'Singapore') {
+                            setCountry('Singapore');
                           }
                         }}
                         className="w-full h-11 px-3.5 rounded-lg bg-[#070809] border border-white/15 text-sm text-white focus:outline-none focus:border-[#A3E635]"
@@ -509,6 +565,7 @@ export function AuthScreen({
                   <input
                     type="email"
                     required
+                    autoComplete="email"
                     disabled={mode === 'reset' && resetStep === 'confirm'}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -525,10 +582,11 @@ export function AuthScreen({
                     <input
                       type={showPassword ? 'text' : 'password'}
                       required
-                      minLength={8}
+                      minLength={mode === 'register' ? 8 : undefined}
+                      autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      placeholder="At least 8 characters"
+                      placeholder={mode === 'login' ? 'Enter your password' : 'At least 8 characters'}
                       className="w-full h-11 px-3.5 pr-11 rounded-lg bg-[#070809] border border-white/15 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:border-[#A3E635]"
                     />
                     <button

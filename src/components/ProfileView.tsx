@@ -28,7 +28,7 @@ export function ProfileView({ user, onUpdated, onNavigate }: ProfileViewProps) {
   const [gyms, setGyms] = useState<Gym[]>([]);
 
   const [displayName, setDisplayName] = useState(user.display_name);
-  const [age, setAge] = useState(user.age);
+  const [age, setAge] = useState(String(Math.min(99, Math.max(18, user.age || 18))));
   const [gender, setGender] = useState(user.gender || 'Prefer not to say');
   const [bio, setBio] = useState(user.bio);
   const [phone, setPhone] = useState(user.phone);
@@ -158,8 +158,10 @@ export function ProfileView({ user, onUpdated, onNavigate }: ProfileViewProps) {
     setSaving(true);
     setError(null);
     setMessage(null);
-    if (age < 18) {
-      setError('You must be at least 18 years old.');
+    const cleanAge = age.trim();
+    const parsedAge = Number(cleanAge);
+    if (!/^\d{2}$/.test(cleanAge) || !Number.isInteger(parsedAge) || parsedAge < 18 || parsedAge > 99) {
+      setError('Please enter a 2-digit age between 18 and 99.');
       setSaving(false);
       return;
     }
@@ -169,7 +171,7 @@ export function ProfileView({ user, onUpdated, onNavigate }: ProfileViewProps) {
         method: 'PUT',
         body: JSON.stringify({
           display_name: displayName,
-          age,
+          age: parsedAge,
           gender,
           bio,
           phone,
@@ -492,14 +494,16 @@ export function ProfileView({ user, onUpdated, onNavigate }: ProfileViewProps) {
               />
             </div>
             <div>
-              <label className="block text-xs text-zinc-400 mb-1">Age (18+)</label>
+              <label className="block text-xs text-zinc-400 mb-1">Age (18–99)</label>
               <input
-                type="number"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]{2}"
+                maxLength={2}
                 required
-                min={18}
-                max={100}
                 value={age}
-                onChange={(e) => setAge(Number(e.target.value))}
+                onChange={(e) => setAge(e.target.value.replace(/\D/g, '').slice(0, 2))}
+                placeholder="24"
                 className="w-full h-10 px-3 rounded-lg bg-[#070809] border border-white/15 text-sm font-mono-num text-white"
               />
             </div>

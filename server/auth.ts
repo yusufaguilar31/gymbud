@@ -24,7 +24,7 @@ export function getSessionSecret(): string {
     const generated = process.env.VERCEL
       ? crypto
           .createHash('sha256')
-          .update(`gymbud:${process.env.VERCEL_PROJECT_ID || process.env.VERCEL_URL || 'vercel-runtime'}`)
+          .update(`gymbud:${process.env.VERCEL_PROJECT_ID || 'vercel-runtime'}`)
           .digest('hex')
       : crypto.randomBytes(48).toString('hex');
     fs.mkdirSync(path.dirname(secretFile), { recursive: true });
@@ -122,8 +122,10 @@ export function isUserPlus(userId: string): boolean {
 }
 
 export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-  const token = req.cookies?.[SESSION_COOKIE_NAME] || req.headers.authorization?.replace('Bearer ', '');
-  const payload = verifySessionToken(token);
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim() || undefined;
+  const cookieToken = req.cookies?.[SESSION_COOKIE_NAME] || undefined;
+  const payload = verifySessionToken(bearerToken) || verifySessionToken(cookieToken);
   if (!payload) {
     res.status(401).json({ error: 'Authentication required' });
     return;
