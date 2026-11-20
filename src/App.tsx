@@ -47,6 +47,7 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [publicMode, setPublicMode] = useState<'landing' | 'login' | 'register' | 'reset'>('landing');
   const [initialResetToken, setInitialResetToken] = useState<string | null>(null);
+  const [initialResetTokenKind, setInitialResetTokenKind] = useState<'token' | 'token_hash'>('token');
   const [initialResetEmail, setInitialResetEmail] = useState<string | null>(null);
   const [initialResetError, setInitialResetError] = useState<string | null>(null);
   const [view, setView] = useState<ActiveView>('discover');
@@ -80,29 +81,40 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const isResetPath =
+      window.location.pathname === '/reset-password' || window.location.pathname === '/reset-password/';
     const params = new URLSearchParams(window.location.search);
     const hashRaw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
     const hashParams = new URLSearchParams(hashRaw);
 
     const sbAccessToken = hashParams.get('access_token');
+    const sbTokenHash = params.get('token_hash');
     const sbType = hashParams.get('type') || params.get('type');
     const sbError = hashParams.get('error_description') || params.get('error_description');
 
     const resetTok =
-      (sbType === 'recovery' && sbAccessToken) ? sbAccessToken : (params.get('reset_token') || params.get('token'));
+      sbType === 'recovery' && sbAccessToken
+        ? sbAccessToken
+        : sbType === 'recovery' && sbTokenHash
+          ? sbTokenHash
+          : (params.get('reset_token') || params.get('token'));
+    const resetKind: 'token' | 'token_hash' =
+      sbType === 'recovery' && !sbAccessToken && sbTokenHash ? 'token_hash' : 'token';
     const resetEm = params.get('email');
 
     if (resetTok) {
       setInitialResetToken(resetTok);
+      setInitialResetTokenKind(resetKind);
       if (resetEm) setInitialResetEmail(resetEm);
       setInitialResetError(null);
       setPublicMode('reset');
       params.delete('reset_token');
       params.delete('token');
+      params.delete('token_hash');
       params.delete('email');
       params.delete('type');
       const remaining = params.toString();
-      window.history.replaceState({}, '', remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname);
+      window.history.replaceState({}, '', remaining ? `/reset-password?${remaining}` : '/reset-password');
     } else if (sbError && (hashParams.has('error') || params.has('error'))) {
       setInitialResetError(sbError.replace(/\+/g, ' '));
       setPublicMode('reset');
@@ -110,7 +122,9 @@ export default function App() {
       params.delete('error_code');
       params.delete('error_description');
       const remaining = params.toString();
-      window.history.replaceState({}, '', remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname);
+      window.history.replaceState({}, '', remaining ? `/reset-password?${remaining}` : '/reset-password');
+    } else if (isResetPath) {
+      setPublicMode('reset');
     }
     refreshMe();
   }, [refreshMe]);
@@ -238,19 +252,28 @@ export default function App() {
       <AuthScreen
         initialMode={publicMode === 'landing' ? 'login' : publicMode}
         initialResetToken={initialResetToken}
+        initialResetTokenKind={initialResetTokenKind}
         initialResetEmail={initialResetEmail}
         initialResetError={initialResetError}
         onBack={() => {
           setInitialResetToken(null);
+          setInitialResetTokenKind('token');
           setInitialResetEmail(null);
           setInitialResetError(null);
           setPublicMode('landing');
+          if (window.location.pathname.startsWith('/reset-password')) {
+            window.history.replaceState({}, '', '/');
+          }
         }}
         onAuthenticated={(loggedInUser) => {
           setInitialResetToken(null);
+          setInitialResetTokenKind('token');
           setInitialResetEmail(null);
           setInitialResetError(null);
           setPublicMode('landing');
+          if (window.location.pathname.startsWith('/reset-password')) {
+            window.history.replaceState({}, '', '/');
+          }
           setUser(loggedInUser);
           setView(loggedInUser.role === 'admin' ? 'admin' : 'discover');
         }}

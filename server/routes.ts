@@ -27,7 +27,7 @@ import {
   verifyInternalCheckoutToken,
   verifyWebhookSignature,
 } from './payments.ts';
-import { isEmailDeliveryConfigured, sendPasswordResetEmail } from './email.ts';
+import { isEmailDeliveryConfigured, isSmtpConfigured, sendPasswordResetEmail } from './email.ts';
 import {
   isSupabaseConfigured,
   checkSupabaseTablesReady,
@@ -39,6 +39,7 @@ import {
   findSupabaseUserByEmail,
   verifySupabaseJwt,
   getSupabaseUserByAccessToken,
+  verifySupabaseRecoveryTokenHash,
   type SupabaseAuthUserRecord,
 } from './supabase.ts';
 import { DEFAULT_COMMUNITY_GUIDELINES } from '../src/shared/constants.ts';
@@ -743,8 +744,27 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     }
 
     const mailConfigured = isEmailDeliveryConfigured();
+    const hasCustomResend = Boolean(
+      process.env.RESEND_API_KEY?.trim() &&
+      process.env.EMAIL_FROM?.trim() &&
+      !/onboarding@resend\.dev/i.test(process.env.EMAIL_FROM)
+    );
+    const hasDirectCodeMailer = Boolean(
+      hasCustomResend || isSmtpConfigured() || process.env.EMAIL_WEBHOOK_URL?.trim()
+    );
+    const recoveryMode: 'code_and_link' | 'link' | 'sandbox' = hasDirectCodeMailer
+      ? 'code_and_link'
+      : isSupabaseConfigured()
+        ? 'link'
+        : 'sandbox';
     const genericMessage =
-      'If an account with that email exists, a secure password reset email has been sent with a reset link and 6-digit code.';
+      'If an account with that email exists, password reset instructions have been sent to that email address.';
+    const baseResponse = {
+      sent: true,
+      mail_configured: mailConfigured,
+      recovery_mode: recoveryMode,
+      message: genericMessage,
+    };
 
     let userRow = db
       .prepare(
@@ -771,16 +791,19 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     }
 
     if (!userRow || userRow.account_status !== 'active') {
-      res.json({ sent: true, mail_configured: mailConfigured, message: genericMessage });
+      res.json(baseResponse);
       return;
     }
 
+    // Recipient is strictly the submitted account email, never an admin/owner email.
+    const recipientEmail = email;
+
     if (isSupabaseConfigured()) {
       try {
-        const existingSb = await findSupabaseUserByEmail(userRow.email);
+        const existingSb = await findSupabaseUserByEmail(recipientEmail);
         if (!existingSb) {
           await provisionSupabaseAuthUser({
-            email: userRow.email,
+            email: recipientEmail,
             password: crypto.randomBytes(24).toString('base64url'),
             metadata: {
               gymbud_user_id: userRow.id,
@@ -821,14 +844,15 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       process.env.APP_URL ||
       'http://localhost:3000';
     const baseUrl = rawOrigin.replace(/\/$/, '');
-    const resetUrl = `${baseUrl}/?reset_token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(userRow.email)}`;
+    const resetPageUrl = `${baseUrl}/reset-password`;
+    const resetUrl = `${resetPageUrl}?reset_token=${encodeURIComponent(rawToken)}`;
 
     try {
       const emailResult = await sendPasswordResetEmail({
-        to: userRow.email,
+        to: recipientEmail,
         displayName: userRow.display_name || 'Athlete',
         resetUrl,
-        redirectTo: baseUrl,
+        redirectTo: resetPageUrl,
         code: resetCode,
         expiresMinutes,
       });
@@ -844,29 +868,62 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
       const isDevSandbox = !mailConfigured && process.env.NODE_ENV !== 'production';
       res.json({
-        sent: true,
-        mail_configured: mailConfigured,
-        delivery_provider: emailResult.provider,
-        ...(emailResult.fallback_reason ? { fallback_reason: emailResult.fallback_reason } : {}),
-        message:
-          emailResult.provider === 'supabase'
-            ? `Recovery email dispatched for ${userRow.email}. Check your inbox (and spam folder) and click the reset link to set a new password.`
-            : genericMessage,
+        ...baseResponse,
         ...(isDevSandbox && emailResult.preview ? { dev_mail_preview: emailResult.preview } : {}),
       });
     } catch (err: any) {
-      const msg = String(err?.message || '');
-      console.error('[Password Reset Email Error]', msg || err);
-      const isRateLimit = msg.toLowerCase().includes('rate limit');
-      res.status(isRateLimit ? 429 : 502).json({
-        error: msg || 'Unable to dispatch reset email right now. Please try again shortly.',
-      });
+      console.error('[Password Reset Email Error]', String(err?.message || err));
+      // Return the identical 200 payload to prevent exposing whether the email exists or provider state
+      res.json(baseResponse);
     }
   });
 
   app.post('/api/auth/verify-reset-token', rateLimit('auth_verify_token', 15, 60_000), async (req, res) => {
     const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
-    if (!rawToken || rawToken.length < 16) {
+    const tokenHashParam = typeof req.body?.token_hash === 'string' ? req.body.token_hash.trim() : '';
+
+    if (!rawToken && !tokenHashParam) {
+      res.status(400).json({ error: 'Invalid or missing password reset token.' });
+      return;
+    }
+
+    if (tokenHashParam && tokenHashParam.length >= 16 && isSupabaseConfigured()) {
+      const verified = await verifySupabaseRecoveryTokenHash(tokenHashParam);
+      const verifiedEmail = (verified?.user?.email || '').trim().toLowerCase();
+      if (!verifiedEmail) {
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+        return;
+      }
+
+      let localUser = db
+        .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+        .get(verifiedEmail) as { id: string; email: string; account_status: string } | undefined;
+
+      if (!localUser) {
+        const sbFull = verified?.user || (await findSupabaseUserByEmail(verifiedEmail));
+        if (sbFull) {
+          hydrateUserFromSupabaseRecord(sbFull);
+          localUser = db
+            .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+            .get(verifiedEmail) as typeof localUser;
+        }
+      }
+
+      if (!localUser || localUser.account_status !== 'active') {
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+        return;
+      }
+
+      res.json({
+        valid: true,
+        email_masked: maskEmailAddress(verifiedEmail),
+        provider: 'supabase',
+        ...(verified?.access_token ? { exchanged_token: verified.access_token } : {}),
+      });
+      return;
+    }
+
+    if (rawToken.length < 16) {
       res.status(400).json({ error: 'Invalid or missing password reset token.' });
       return;
     }
@@ -895,7 +952,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       }
 
       if (!localUser || localUser.account_status !== 'active') {
-        res.status(400).json({ error: 'This password reset link is invalid or account is inactive.' });
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
         return;
       }
 
@@ -934,6 +991,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   app.post('/api/auth/reset-password', rateLimit('auth_reset', 10, 60_000), async (req, res) => {
     const email = sanitizeText(req.body?.email, 160).toLowerCase();
     const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+    const tokenHashParam = typeof req.body?.token_hash === 'string' ? req.body.token_hash.trim() : '';
     const resetCode = sanitizeText(req.body?.code, 12);
     const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
 
@@ -942,10 +1000,21 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       return;
     }
 
-    if (rawToken && rawToken.split('.').length === 3 && isSupabaseConfigured()) {
-      const jwtPayload = await verifySupabaseJwt(rawToken);
-      const sbUser = jwtPayload?.email ? null : await getSupabaseUserByAccessToken(rawToken);
-      const verifiedEmail = (jwtPayload?.email || sbUser?.email || '').trim().toLowerCase();
+    if ((tokenHashParam && tokenHashParam.length >= 16 || (rawToken && rawToken.split('.').length === 3)) && isSupabaseConfigured()) {
+      let verifiedEmail = '';
+      let sbUserRecord: SupabaseAuthUserRecord | null = null;
+
+      if (tokenHashParam) {
+        const verified = await verifySupabaseRecoveryTokenHash(tokenHashParam);
+        verifiedEmail = (verified?.user?.email || '').trim().toLowerCase();
+        sbUserRecord = verified?.user || null;
+      } else {
+        const jwtPayload = await verifySupabaseJwt(rawToken);
+        const sbUser = jwtPayload?.email ? null : await getSupabaseUserByAccessToken(rawToken);
+        verifiedEmail = (jwtPayload?.email || sbUser?.email || '').trim().toLowerCase();
+        sbUserRecord = sbUser;
+      }
+
       if (!verifiedEmail) {
         res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
         return;
@@ -956,7 +1025,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         .get(verifiedEmail) as { id: string; email: string; account_status: string } | undefined;
 
       if (!targetUser) {
-        const sbFull = sbUser || (await findSupabaseUserByEmail(verifiedEmail));
+        const sbFull = sbUserRecord || (await findSupabaseUserByEmail(verifiedEmail));
         if (sbFull) {
           hydrateUserFromSupabaseRecord(sbFull);
           targetUser = db
@@ -966,7 +1035,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       }
 
       if (!targetUser || targetUser.account_status !== 'active') {
-        res.status(400).json({ error: 'Account not found or inactive.' });
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
         return;
       }
 
@@ -1025,12 +1094,15 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         return;
       }
 
+      const uniformCodeError =
+        'Invalid or expired reset verification code. Please check your code or request a new reset email.';
+
       const userRow = db
         .prepare(`SELECT id, account_status FROM users WHERE email = ?`)
         .get(email) as { id: string; account_status: string } | undefined;
 
       if (!userRow || userRow.account_status !== 'active') {
-        res.status(400).json({ error: 'Invalid or expired reset verification code.' });
+        res.status(400).json({ error: uniformCodeError });
         return;
       }
 
@@ -1045,7 +1117,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         .get(userRow.id) as typeof matchedRecord;
 
       if (!latest || Date.parse(latest.expires_at) <= Date.now() || latest.attempts >= 5) {
-        res.status(400).json({ error: 'Reset code has expired. Please request a new reset email.' });
+        res.status(400).json({ error: uniformCodeError });
         return;
       }
 
@@ -1057,11 +1129,10 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
             nextAttempts,
             latest.id
           );
-          res.status(400).json({ error: 'Too many invalid attempts. Please request a new reset email.' });
-          return;
+        } else {
+          db.prepare(`UPDATE password_reset_tokens SET attempts = ? WHERE id = ?`).run(nextAttempts, latest.id);
         }
-        db.prepare(`UPDATE password_reset_tokens SET attempts = ? WHERE id = ?`).run(nextAttempts, latest.id);
-        res.status(400).json({ error: 'Invalid reset verification code.' });
+        res.status(400).json({ error: uniformCodeError });
         return;
       }
 
@@ -2941,7 +3012,8 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       process.env.APP_URL ||
       'http://localhost:3000';
     const baseUrl = rawOrigin.replace(/\/$/, '');
-    const resetUrl = `${baseUrl}/?reset_token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(target.email)}`;
+    const resetPageUrl = `${baseUrl}/reset-password`;
+    const resetUrl = `${resetPageUrl}?reset_token=${encodeURIComponent(rawToken)}`;
 
     let emailed = false;
     let provider: string = 'none';
@@ -2952,7 +3024,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         to: target.email,
         displayName: target.display_name || 'Athlete',
         resetUrl,
-        redirectTo: baseUrl,
+        redirectTo: resetPageUrl,
         code: resetCode,
         expiresMinutes,
       });

@@ -6,6 +6,7 @@ import type { CurrentUser } from '../shared/types.ts';
 interface AuthScreenProps {
   initialMode: 'login' | 'register' | 'reset';
   initialResetToken?: string | null;
+  initialResetTokenKind?: 'token' | 'token_hash';
   initialResetEmail?: string | null;
   initialResetError?: string | null;
   onBack: () => void;
@@ -23,6 +24,7 @@ interface DevMailPreview {
 export function AuthScreen({
   initialMode,
   initialResetToken = null,
+  initialResetTokenKind = 'token',
   initialResetEmail = null,
   initialResetError = null,
   onBack,
@@ -42,8 +44,11 @@ export function AuthScreen({
   // Password recovery state
   const [resetStep, setResetStep] = useState<'request' | 'confirm'>(initialResetToken ? 'confirm' : 'request');
   const [resetToken, setResetToken] = useState<string | null>(initialResetToken);
+  const [resetTokenKind, setResetTokenKind] = useState<'token' | 'token_hash'>(initialResetTokenKind);
+  const [verifiedSubmitToken, setVerifiedSubmitToken] = useState<string | null>(null);
   const [recoveryEmailSent, setRecoveryEmailSent] = useState(false);
-  const [deliveryProvider, setDeliveryProvider] = useState<'resend' | 'smtp' | 'webhook' | 'supabase' | 'sandbox' | null>(null);
+  const [recoveryMode, setRecoveryMode] = useState<'code_and_link' | 'link' | 'sandbox' | null>(null);
+  const [manualCodeMode, setManualCodeMode] = useState(false);
   const [resetCode, setResetCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -72,24 +77,32 @@ export function AuthScreen({
     const hashParams = new URLSearchParams(hashRaw);
 
     const sbAccessToken = hashParams.get('access_token');
+    const sbTokenHash = params.get('token_hash');
     const sbType = hashParams.get('type') || params.get('type');
     const sbError = hashParams.get('error_description') || params.get('error_description');
 
     const rawToken =
-      sbType === 'recovery' && sbAccessToken ? sbAccessToken : (params.get('reset_token') || params.get('token'));
+      sbType === 'recovery' && sbAccessToken
+        ? sbAccessToken
+        : sbType === 'recovery' && sbTokenHash
+          ? sbTokenHash
+          : (params.get('reset_token') || params.get('token'));
+    const detectedKind: 'token' | 'token_hash' =
+      sbType === 'recovery' && !sbAccessToken && sbTokenHash ? 'token_hash' : 'token';
     const rawEmail = params.get('email');
 
     if (rawToken !== null) {
       const trimmedToken = rawToken.trim();
       params.delete('reset_token');
       params.delete('token');
+      params.delete('token_hash');
       params.delete('email');
       params.delete('type');
       const remaining = params.toString();
       window.history.replaceState(
         {},
         '',
-        remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname
+        remaining ? `/reset-password?${remaining}` : '/reset-password'
       );
 
       setMode('reset');
@@ -99,10 +112,13 @@ export function AuthScreen({
       }
 
       if (trimmedToken.length >= 16 && /^[A-Za-z0-9_.-]+$/.test(trimmedToken)) {
+        setResetTokenKind(detectedKind);
         setResetToken(trimmedToken);
+        setVerifiedSubmitToken(null);
         setResetStep('confirm');
       } else {
         setResetToken(null);
+        setVerifiedSubmitToken(null);
         setResetStep('request');
         setError('This password reset link is invalid or malformed. Request a new recovery email below.');
       }
@@ -114,7 +130,7 @@ export function AuthScreen({
       window.history.replaceState(
         {},
         '',
-        remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname
+        remaining ? `/reset-password?${remaining}` : '/reset-password'
       );
       setMode('reset');
       setResetStep('request');
@@ -140,37 +156,43 @@ export function AuthScreen({
       setEmail(initialResetEmail.trim());
     }
     if (trimmedToken.length >= 16 && /^[A-Za-z0-9_.-]+$/.test(trimmedToken)) {
+      setResetTokenKind(initialResetTokenKind);
       setResetToken(trimmedToken);
+      setVerifiedSubmitToken(null);
       setResetStep('confirm');
     } else {
       setResetToken(null);
+      setVerifiedSubmitToken(null);
       setResetStep('request');
       setError('This password reset link is invalid or malformed. Request a new recovery email below.');
     }
-  }, [initialResetToken, initialResetEmail]);
+  }, [initialResetToken, initialResetTokenKind, initialResetEmail]);
 
   // Verify email reset token whenever resetToken changes
   useEffect(() => {
     if (!resetToken) {
       setVerifyingToken(false);
+      setVerifiedSubmitToken(null);
       return;
     }
     let active = true;
     setVerifyingToken(true);
     setError(null);
-    api<{ valid: boolean; email_masked: string }>('/api/auth/verify-reset-token', {
+    api<{ valid: boolean; email_masked: string; exchanged_token?: string }>('/api/auth/verify-reset-token', {
       method: 'POST',
-      body: JSON.stringify({ token: resetToken }),
+      body: JSON.stringify(resetTokenKind === 'token_hash' ? { token_hash: resetToken } : { token: resetToken }),
     })
       .then((res) => {
         if (!active) return;
         setMaskedEmail(res.email_masked);
+        setVerifiedSubmitToken(res.exchanged_token || resetToken);
         setRecoveryEmailSent(false);
         setResetStep('confirm');
       })
       .catch((err: any) => {
         if (!active) return;
         setResetToken(null);
+        setVerifiedSubmitToken(null);
         setResetStep('request');
         setRecoveryEmailSent(false);
         setError(err?.message || 'This password reset link is invalid or has expired. Request a new email below.');
@@ -181,7 +203,7 @@ export function AuthScreen({
     return () => {
       active = false;
     };
-  }, [resetToken]);
+  }, [resetToken, resetTokenKind]);
 
   // Cooldown timer for resending reset email
   useEffect(() => {
@@ -203,7 +225,7 @@ export function AuthScreen({
       const res = await api<{
         sent: boolean;
         mail_configured: boolean;
-        delivery_provider?: 'resend' | 'smtp' | 'webhook' | 'supabase' | 'sandbox';
+        recovery_mode?: 'code_and_link' | 'link' | 'sandbox';
         message: string;
         dev_mail_preview?: DevMailPreview;
       }>('/api/auth/forgot-password', {
@@ -211,7 +233,9 @@ export function AuthScreen({
         body: JSON.stringify({ email: cleanEmail }),
       });
       setRecoveryEmailSent(true);
-      setDeliveryProvider(res.delivery_provider || null);
+      const nextRecoveryMode = res.recovery_mode || 'code_and_link';
+      setRecoveryMode(nextRecoveryMode);
+      setManualCodeMode(nextRecoveryMode !== 'link');
       setResetMessage(res.message);
       setDevMailPreview(res.dev_mail_preview || null);
       setResetStep('confirm');
@@ -244,18 +268,24 @@ export function AuthScreen({
 
       setLoading(true);
       try {
+        const submitToken = verifiedSubmitToken || resetToken;
+        const payload = submitToken
+          ? submitToken === resetToken && resetTokenKind === 'token_hash'
+            ? { token_hash: submitToken, new_password: newPassword }
+            : { token: submitToken, new_password: newPassword }
+          : { email, code: resetCode.trim(), new_password: newPassword };
+
         const res = await api<{ reset: boolean; message: string }>('/api/auth/reset-password', {
           method: 'POST',
-          body: JSON.stringify(
-            resetToken
-              ? { token: resetToken, new_password: newPassword }
-              : { email, code: resetCode.trim(), new_password: newPassword }
-          ),
+          body: JSON.stringify(payload),
         });
         setMode('login');
         setResetStep('request');
         setRecoveryEmailSent(false);
+        setRecoveryMode(null);
+        setManualCodeMode(false);
         setResetToken(null);
+        setVerifiedSubmitToken(null);
         setResetCode('');
         setNewPassword('');
         setConfirmNewPassword('');
@@ -263,6 +293,9 @@ export function AuthScreen({
         setMaskedEmail(null);
         setPassword('');
         setResetMessage(res.message);
+        if (window.location.pathname.startsWith('/reset-password')) {
+          window.history.replaceState({}, '', '/');
+        }
       } catch (err: any) {
         setError(err?.message || 'Unable to reset password.');
       } finally {
@@ -367,8 +400,10 @@ export function AuthScreen({
     setMode('reset');
     setResetStep('request');
     setRecoveryEmailSent(false);
-    setDeliveryProvider(null);
+    setRecoveryMode(null);
+    setManualCodeMode(false);
     setResetToken(null);
+    setVerifiedSubmitToken(null);
     setResetCode('');
     setNewPassword('');
     setConfirmNewPassword('');
@@ -378,7 +413,8 @@ export function AuthScreen({
     setError(null);
   }
 
-  const awaitingSupabaseLink = mode === 'reset' && resetStep === 'confirm' && !resetToken && deliveryProvider === 'supabase';
+  const awaitingResetLinkOnly =
+    mode === 'reset' && resetStep === 'confirm' && !resetToken && recoveryMode === 'link' && !manualCodeMode;
 
   return (
     <div className="min-h-screen bg-[#070809] text-zinc-100 flex flex-col justify-center py-10 px-4 sm:px-6">
@@ -404,12 +440,12 @@ export function AuthScreen({
                   : mode === 'register'
                     ? '18+ fitness community · Free unlimited matching.'
                     : resetStep === 'request'
-                      ? 'Enter your account email and we will send a secure password recovery email.'
+                      ? 'Enter your account email and we will send password reset instructions to that address.'
                       : resetToken
                         ? `Verified reset link${maskedEmail ? ` for ${maskedEmail}` : ''}. Choose a strong new password.`
-                        : awaitingSupabaseLink
-                          ? 'Check your inbox (and spam folder) and click the secure reset link we sent you.'
-                          : 'Check your inbox for the 6-digit code or click the link in your email.'}
+                        : awaitingResetLinkOnly
+                          ? 'Check your inbox (and spam folder) for your reset link, or switch to 6-digit code entry.'
+                          : 'Enter the 6-digit recovery code or click the reset link in your email.'}
               </p>
             </div>
           </div>
@@ -456,7 +492,7 @@ export function AuthScreen({
               {recoveryEmailSent && mode === 'reset' && (
                 <div className="flex items-center gap-2 font-semibold text-white">
                   <Mail className="w-4 h-4 text-[#A3E635] shrink-0" />
-                  <span>Recovery email sent{email ? ` to ${email}` : ''}</span>
+                  <span>Reset instructions requested{email ? ` for ${email}` : ''}</span>
                 </div>
               )}
               {resetMessage && (
@@ -642,11 +678,11 @@ export function AuthScreen({
                 </div>
               )}
 
-              {mode === 'reset' && resetStep === 'confirm' && awaitingSupabaseLink && (
+              {mode === 'reset' && resetStep === 'confirm' && awaitingResetLinkOnly && (
                 <div className="p-4 rounded-xl bg-[#070809] border border-white/10 space-y-3">
                   <p className="text-xs text-zinc-300 leading-relaxed">
-                    Click the <span className="text-white font-semibold">Reset Password</span> link inside the email sent to{' '}
-                    <span className="text-white font-medium">{email}</span>. That link opens GYMBUD right back here so you can set your new password.
+                    If <span className="text-white font-medium">{email}</span> is registered, check that inbox (and spam folder) and click the{' '}
+                    <span className="text-white font-semibold">Reset Password</span> link to return directly to GYMBUD&apos;s reset page.
                   </p>
                   <button
                     type="button"
@@ -657,10 +693,17 @@ export function AuthScreen({
                     <RefreshCw className="w-3.5 h-3.5 text-[#A3E635]" />
                     {resendCooldown > 0 ? `Resend recovery email in ${resendCooldown}s` : 'Resend recovery email'}
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => setManualCodeMode(true)}
+                    className="w-full text-center text-xs text-[#A3E635] hover:underline cursor-pointer py-1"
+                  >
+                    Already have a 6-digit recovery code? Enter code
+                  </button>
                 </div>
               )}
 
-              {mode === 'reset' && resetStep === 'confirm' && !awaitingSupabaseLink && (
+              {mode === 'reset' && resetStep === 'confirm' && !awaitingResetLinkOnly && (
                 <>
                   {!resetToken && (
                     <div>
@@ -727,7 +770,7 @@ export function AuthScreen({
                 </>
               )}
 
-              {!awaitingSupabaseLink && (
+              {!awaitingResetLinkOnly && (
                 <button
                   type="submit"
                   disabled={loading}
@@ -752,8 +795,10 @@ export function AuthScreen({
                   onClick={() => {
                     setResetStep('request');
                     setRecoveryEmailSent(false);
-                    setDeliveryProvider(null);
+                    setRecoveryMode(null);
+                    setManualCodeMode(false);
                     setResetToken(null);
+                    setVerifiedSubmitToken(null);
                     setResetCode('');
                     setMaskedEmail(null);
                     setDevMailPreview(null);
@@ -785,13 +830,18 @@ export function AuthScreen({
                   setMode('login');
                   setResetStep('request');
                   setRecoveryEmailSent(false);
-                  setDeliveryProvider(null);
+                  setRecoveryMode(null);
+                  setManualCodeMode(false);
                   setResetToken(null);
+                  setVerifiedSubmitToken(null);
                   setResetCode('');
                   setMaskedEmail(null);
                   setDevMailPreview(null);
                   setResetMessage(null);
                   setError(null);
+                  if (window.location.pathname.startsWith('/reset-password')) {
+                    window.history.replaceState({}, '', '/');
+                  }
                 }}
                 className="hover:text-white cursor-pointer py-2"
               >
@@ -804,37 +854,38 @@ export function AuthScreen({
             </span>
           </div>
 
-          {/* Owner Admin Quick Access */}
-          <div className="mt-6 pt-5 border-t border-white/10">
-            <button
-              type="button"
-              onClick={() => setShowTestAccounts(!showTestAccounts)}
-              className="w-full flex items-center justify-between text-xs font-medium text-zinc-400 hover:text-white cursor-pointer py-1"
-            >
-              <span className="inline-flex items-center gap-2">
-                <Users className="w-3.5 h-3.5 text-[#A3E635]" />
-                Owner Admin Quick Sign In
-              </span>
-              <span>{showTestAccounts ? 'Hide' : 'Show'}</span>
-            </button>
+          {mode === 'login' && (
+            <div className="mt-6 pt-5 border-t border-white/10">
+              <button
+                type="button"
+                onClick={() => setShowTestAccounts(!showTestAccounts)}
+                className="w-full flex items-center justify-between text-xs font-medium text-zinc-400 hover:text-white cursor-pointer py-1"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Users className="w-3.5 h-3.5 text-[#A3E635]" />
+                  Owner Admin Quick Sign In
+                </span>
+                <span>{showTestAccounts ? 'Hide' : 'Show'}</span>
+              </button>
 
-            {showTestAccounts && (
-              <div className="mt-3 space-y-2">
-                <p className="text-xs text-zinc-500">
-                  Sign in as the Owner Admin (default password: <span className="font-mono-num text-zinc-300">Gymbud2026!</span> — change anytime via Forgot password):
-                </p>
-                <button
-                  type="button"
-                  disabled={loading}
-                  onClick={() => loginAsSeededUser('yusufaguilar2008@gmail.com')}
-                  className="w-full text-left px-3 py-2.5 rounded-lg border border-white/10 bg-[#070809] hover:border-[#A3E635]/50 transition-colors cursor-pointer"
-                >
-                  <div className="text-xs font-semibold text-white">Yusuf Aguilar · Owner Admin (Full Console Access)</div>
-                  <div className="text-[11px] font-mono-num text-zinc-400">yusufaguilar2008@gmail.com</div>
-                </button>
-              </div>
-            )}
-          </div>
+              {showTestAccounts && (
+                <div className="mt-3 space-y-2">
+                  <p className="text-xs text-zinc-500">
+                    Sign in as the Owner Admin (default password: <span className="font-mono-num text-zinc-300">Gymbud2026!</span>):
+                  </p>
+                  <button
+                    type="button"
+                    disabled={loading}
+                    onClick={() => loginAsSeededUser('yusufaguilar2008@gmail.com')}
+                    className="w-full text-left px-3 py-2.5 rounded-lg border border-white/10 bg-[#070809] hover:border-[#A3E635]/50 transition-colors cursor-pointer"
+                  >
+                    <div className="text-xs font-semibold text-white">Yusuf Aguilar · Owner Admin (Full Console Access)</div>
+                    <div className="text-[11px] font-mono-num text-zinc-400">yusufaguilar2008@gmail.com</div>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

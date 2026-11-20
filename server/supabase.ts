@@ -170,6 +170,36 @@ export async function sendSupabaseRecoveryEmail(
   }
 }
 
+export async function verifySupabaseRecoveryTokenHash(
+  tokenHash: string
+): Promise<{ access_token?: string; user?: SupabaseAuthUserRecord } | null> {
+  const cfg = getSupabaseConfig();
+  if (!cfg || !cfg.publishableKey || !tokenHash) return null;
+  try {
+    const res = await fetch(`${cfg.url}/auth/v1/verify`, {
+      method: 'POST',
+      headers: {
+        apikey: cfg.publishableKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type: 'recovery',
+        token_hash: tokenHash,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      access_token?: string;
+      user?: SupabaseAuthUserRecord;
+    };
+    if (!data?.user?.email && !data?.access_token) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 export async function provisionSupabaseAuthUser(params: {
   email: string;
   password: string;
