@@ -113,10 +113,10 @@ function hydrateUserFromSupabaseRecord(sbUser: SupabaseAuthUserRecord): string |
 }
 
 let lastSupabaseDiscoverSync = 0;
-async function syncMissingSupabaseUsersToSqlite(): Promise<void> {
+async function syncMissingSupabaseUsersToSqlite(force = false): Promise<void> {
   if (!isSupabaseConfigured()) return;
   const now = Date.now();
-  if (now - lastSupabaseDiscoverSync < 4000) return;
+  if (!force && now - lastSupabaseDiscoverSync < 4000) return;
   lastSupabaseDiscoverSync = now;
   try {
     const sbUsers = await listSupabaseUsers();
@@ -775,22 +775,21 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       return;
     }
 
-    const usingSupabaseDelivery =
-      isSupabaseConfigured() &&
-      !process.env.RESEND_API_KEY?.trim() &&
-      !process.env.EMAIL_WEBHOOK_URL?.trim();
-
-    if (usingSupabaseDelivery) {
-      const existingSb = await findSupabaseUserByEmail(userRow.email);
-      if (!existingSb) {
-        await provisionSupabaseAuthUser({
-          email: userRow.email,
-          password: crypto.randomBytes(24).toString('base64url'),
-          metadata: {
-            gymbud_user_id: userRow.id,
-            display_name: userRow.display_name || 'Athlete',
-          },
-        });
+    if (isSupabaseConfigured()) {
+      try {
+        const existingSb = await findSupabaseUserByEmail(userRow.email);
+        if (!existingSb) {
+          await provisionSupabaseAuthUser({
+            email: userRow.email,
+            password: crypto.randomBytes(24).toString('base64url'),
+            metadata: {
+              gymbud_user_id: userRow.id,
+              display_name: userRow.display_name || 'Athlete',
+            },
+          });
+        }
+      } catch {
+        // Non-fatal: primary mail provider may still succeed
       }
     }
 
@@ -813,9 +812,12 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     });
     tx();
 
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https')
+      .split(',')[0]
+      .trim();
     const rawOrigin =
       (typeof req.headers.origin === 'string' && req.headers.origin.startsWith('http') ? req.headers.origin : null) ||
-      (req.get('host') ? `${req.headers['x-forwarded-proto'] || req.protocol}://${req.get('host')}` : null) ||
+      (req.get('host') ? `${forwardedProto}://${req.get('host')}` : null) ||
       process.env.APP_URL ||
       'http://localhost:3000';
     const baseUrl = rawOrigin.replace(/\/$/, '');
@@ -845,9 +847,10 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         sent: true,
         mail_configured: mailConfigured,
         delivery_provider: emailResult.provider,
+        ...(emailResult.fallback_reason ? { fallback_reason: emailResult.fallback_reason } : {}),
         message:
           emailResult.provider === 'supabase'
-            ? 'Recovery email sent! Open your inbox (and spam folder) and click the reset link to set a new password.'
+            ? `Recovery email dispatched for ${userRow.email}. Check your inbox (and spam folder) and click the reset link to set a new password.`
             : genericMessage,
         ...(isDevSandbox && emailResult.preview ? { dev_mail_preview: emailResult.preview } : {}),
       });
@@ -2662,7 +2665,10 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   // ==========================================
   // 12. ADMIN DASHBOARD (STRICT RBAC + AUDIT)
   // ==========================================
-  app.get('/api/admin/overview', requireAuth, requireAdmin, (_req: AuthenticatedRequest, res) => {
+  app.get('/api/admin/overview', requireAuth, requireAdmin, async (_req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    await syncMissingSupabaseUsersToSqlite(true);
+
     const stats = {
       total_users: (db.prepare(`SELECT COUNT(*) AS cnt FROM users`).get() as { cnt: number }).cnt,
       active_matches: (db.prepare(`SELECT COUNT(*) AS cnt FROM matches WHERE status = 'active'`).get() as { cnt: number }).cnt,
@@ -2674,11 +2680,18 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
     const users = db
       .prepare(
-        `SELECT u.id, u.email, u.role, u.account_status, u.email_verified, u.phone_verified, u.selfie_verified, u.suspicious_score, u.created_at,
-                p.display_name, p.city, p.age,
+        `SELECT u.id, u.email, u.phone, u.role, u.account_status, u.email_verified, u.phone_verified, u.selfie_verified,
+                u.suspicious_score, u.last_active_at, u.created_at,
+                COALESCE(p.display_name, u.email) AS display_name,
+                COALESCE(p.city, '') AS city,
+                COALESCE(p.country, '') AS country,
+                COALESCE(p.age, 24) AS age,
+                COALESCE(p.gender, '') AS gender,
+                COALESCE(p.avatar_url, '') AS avatar_url,
+                COALESCE(p.onboarding_completed, 0) AS onboarding_completed,
                 EXISTS(SELECT 1 FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active') AS is_plus
          FROM users u
-         JOIN profiles p ON p.user_id = u.id
+         LEFT JOIN profiles p ON p.user_id = u.id
          ORDER BY datetime(u.created_at) DESC`
       )
       .all();
@@ -2716,9 +2729,9 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
     const auditLogs = db
       .prepare(
-        `SELECT a.*, p.display_name AS actor_name
+        `SELECT a.*, COALESCE(p.display_name, 'Admin') AS actor_name
          FROM audit_logs a
-         JOIN profiles p ON p.user_id = a.actor_id
+         LEFT JOIN profiles p ON p.user_id = a.actor_id
          ORDER BY datetime(a.created_at) DESC LIMIT 60`
       )
       .all();
@@ -2783,6 +2796,193 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     );
 
     res.json({ ok: true });
+  });
+
+  app.post('/api/admin/users/:userId/password', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
+    const targetId = sanitizeText(req.params.userId, 64);
+    const newPassword = typeof req.body?.new_password === 'string' ? req.body.new_password : '';
+
+    if (newPassword.length < 8 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword)) {
+      res.status(400).json({
+        error: 'New password must be at least 8 characters and include both letters and numbers.',
+      });
+      return;
+    }
+
+    const target = db
+      .prepare(
+        `SELECT u.id, u.email, u.role, p.display_name
+         FROM users u
+         LEFT JOIN profiles p ON p.user_id = u.id
+         WHERE u.id = ?`
+      )
+      .get(targetId) as { id: string; email: string; role: string; display_name: string | null } | undefined;
+
+    if (!target) {
+      res.status(404).json({ error: 'User account not found.' });
+      return;
+    }
+
+    const tx = db.transaction(() => {
+      db.prepare(`UPDATE users SET password_hash = ?, email_code = NULL WHERE id = ?`).run(
+        hashPassword(newPassword),
+        target.id
+      );
+      db.prepare(`UPDATE password_reset_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(
+        target.id
+      );
+      db.prepare(
+        `INSERT INTO audit_logs (id, actor_id, action, target_type, target_id, details_json)
+         VALUES (?, ?, 'admin_reset_password', 'user', ?, ?)`
+      ).run(
+        `aud_${crypto.randomBytes(8).toString('hex')}`,
+        req.authUser!.id,
+        target.id,
+        JSON.stringify({ email: target.email })
+      );
+    });
+    tx();
+
+    if (isSupabaseConfigured()) {
+      const updated = await updateSupabaseAuthUser({ email: target.email, password: newPassword });
+      if (!updated) {
+        await provisionSupabaseAuthUser({
+          email: target.email,
+          password: newPassword,
+          metadata: {
+            gymbud_user_id: target.id,
+            display_name: target.display_name || target.email.split('@')[0],
+            role: target.role,
+          },
+        });
+      }
+    }
+
+    createNotification({
+      userId: target.id,
+      type: 'security',
+      title: 'Password Updated by Admin',
+      bodySafe: 'An administrator updated your GYMBUD password. Contact safety support if you did not request this.',
+      linkView: 'safety',
+      hub,
+    });
+
+    res.json({ ok: true, message: `Password updated for ${target.email}.` });
+  });
+
+  app.post('/api/admin/users/:userId/recovery-code', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
+    const targetId = sanitizeText(req.params.userId, 64);
+    const target = db
+      .prepare(
+        `SELECT u.id, u.email, u.account_status, p.display_name
+         FROM users u
+         LEFT JOIN profiles p ON p.user_id = u.id
+         WHERE u.id = ?`
+      )
+      .get(targetId) as { id: string; email: string; account_status: string; display_name: string | null } | undefined;
+
+    if (!target) {
+      res.status(404).json({ error: 'User account not found.' });
+      return;
+    }
+
+    if (isSupabaseConfigured()) {
+      try {
+        const existingSb = await findSupabaseUserByEmail(target.email);
+        if (!existingSb) {
+          await provisionSupabaseAuthUser({
+            email: target.email,
+            password: crypto.randomBytes(24).toString('base64url'),
+            metadata: {
+              gymbud_user_id: target.id,
+              display_name: target.display_name || 'Athlete',
+            },
+          });
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    const rawToken = crypto.randomBytes(32).toString('base64url');
+    const resetCode = String(crypto.randomInt(100000, 999999));
+    const tokenHash = hashResetSecret(rawToken);
+    const codeHash = hashResetSecret(resetCode);
+    const expiresMinutes = 15;
+    const expiresAt = new Date(Date.now() + expiresMinutes * 60 * 1000).toISOString();
+    const tokenId = `rst_${crypto.randomBytes(8).toString('hex')}`;
+
+    const tx = db.transaction(() => {
+      db.prepare(`UPDATE password_reset_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(
+        target.id
+      );
+      db.prepare(
+        `INSERT INTO password_reset_tokens (id, user_id, token_hash, code_hash, expires_at)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(tokenId, target.id, tokenHash, codeHash, expiresAt);
+      db.prepare(
+        `INSERT INTO audit_logs (id, actor_id, action, target_type, target_id, details_json)
+         VALUES (?, ?, 'admin_issue_recovery_code', 'user', ?, ?)`
+      ).run(
+        `aud_${crypto.randomBytes(8).toString('hex')}`,
+        req.authUser!.id,
+        target.id,
+        JSON.stringify({ email: target.email })
+      );
+    });
+    tx();
+
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https')
+      .split(',')[0]
+      .trim();
+    const rawOrigin =
+      (typeof req.headers.origin === 'string' && req.headers.origin.startsWith('http') ? req.headers.origin : null) ||
+      (req.get('host') ? `${forwardedProto}://${req.get('host')}` : null) ||
+      process.env.APP_URL ||
+      'http://localhost:3000';
+    const baseUrl = rawOrigin.replace(/\/$/, '');
+    const resetUrl = `${baseUrl}/?reset_token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(target.email)}`;
+
+    let emailed = false;
+    let provider: string = 'none';
+    let emailError: string | null = null;
+
+    try {
+      const result = await sendPasswordResetEmail({
+        to: target.email,
+        displayName: target.display_name || 'Athlete',
+        resetUrl,
+        redirectTo: baseUrl,
+        code: resetCode,
+        expiresMinutes,
+      });
+      emailed = result.delivered;
+      provider = result.provider;
+    } catch (err: any) {
+      emailError = err?.message || 'Unable to send email via configured mail provider.';
+    }
+
+    createNotification({
+      userId: target.id,
+      type: 'security',
+      title: 'Recovery Code Issued',
+      bodySafe: 'An administrator issued a single-use password recovery code for your account.',
+      linkView: 'safety',
+      hub,
+    });
+
+    res.json({
+      ok: true,
+      emailed,
+      provider,
+      emailed_to: target.email,
+      code: resetCode,
+      expires_minutes: expiresMinutes,
+      ...(emailError ? { email_error: emailError } : {}),
+      message: emailed
+        ? `Recovery email dispatched to ${target.email} (via ${provider}).`
+        : `Recovery code generated for ${target.email}, but external email delivery could not complete.`,
+    });
   });
 
   app.post('/api/admin/verifications/:id/review', requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {

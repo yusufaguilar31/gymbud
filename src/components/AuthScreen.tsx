@@ -43,7 +43,7 @@ export function AuthScreen({
   const [resetStep, setResetStep] = useState<'request' | 'confirm'>(initialResetToken ? 'confirm' : 'request');
   const [resetToken, setResetToken] = useState<string | null>(initialResetToken);
   const [recoveryEmailSent, setRecoveryEmailSent] = useState(false);
-  const [deliveryProvider, setDeliveryProvider] = useState<'resend' | 'webhook' | 'supabase' | 'sandbox' | null>(null);
+  const [deliveryProvider, setDeliveryProvider] = useState<'resend' | 'smtp' | 'webhook' | 'supabase' | 'sandbox' | null>(null);
   const [resetCode, setResetCode] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -203,7 +203,7 @@ export function AuthScreen({
       const res = await api<{
         sent: boolean;
         mail_configured: boolean;
-        delivery_provider?: 'resend' | 'webhook' | 'supabase' | 'sandbox';
+        delivery_provider?: 'resend' | 'smtp' | 'webhook' | 'supabase' | 'sandbox';
         message: string;
         dev_mail_preview?: DevMailPreview;
       }>('/api/auth/forgot-password', {

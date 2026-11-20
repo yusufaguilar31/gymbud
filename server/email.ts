@@ -1,3 +1,4 @@
+import nodemailer from 'nodemailer';
 import { isSupabaseConfigured, sendSupabaseRecoveryEmail } from './supabase.ts';
 
 export interface PasswordResetEmailParams {
@@ -11,8 +12,9 @@ export interface PasswordResetEmailParams {
 
 export interface EmailSendResult {
   delivered: boolean;
-  provider: 'resend' | 'webhook' | 'supabase' | 'sandbox';
+  provider: 'resend' | 'smtp' | 'webhook' | 'supabase' | 'sandbox';
   subject: string;
+  fallback_reason?: string;
   preview?: {
     to: string;
     subject: string;
@@ -22,9 +24,44 @@ export interface EmailSendResult {
   };
 }
 
+interface SmtpConfig {
+  host: string;
+  port: number;
+  secure: boolean;
+  user: string;
+  pass: string;
+}
+
+function getSmtpConfig(): SmtpConfig | null {
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').trim();
+  let host = (process.env.SMTP_HOST || '').trim();
+
+  if (!user || !pass) return null;
+  if (!host) {
+    if (/@(gmail|googlemail)\.com$/i.test(user)) {
+      host = 'smtp.gmail.com';
+    } else {
+      return null;
+    }
+  }
+
+  const port = Number(process.env.SMTP_PORT) || (host === 'smtp.gmail.com' ? 465 : 587);
+  const secure = process.env.SMTP_SECURE !== undefined
+    ? process.env.SMTP_SECURE === 'true'
+    : port === 465;
+
+  return { host, port, secure, user, pass };
+}
+
+export function isSmtpConfigured(): boolean {
+  return Boolean(getSmtpConfig());
+}
+
 export function isEmailDeliveryConfigured(): boolean {
   return Boolean(
     process.env.RESEND_API_KEY?.trim() ||
+    isSmtpConfigured() ||
     process.env.EMAIL_WEBHOOK_URL?.trim() ||
     isSupabaseConfigured()
   );
@@ -85,54 +122,155 @@ export async function sendPasswordResetEmail(params: PasswordResetEmailParams): 
     `If you did not request this, you can safely ignore this email.`,
   ].join('\n');
 
-  const from = process.env.EMAIL_FROM?.trim() || 'GYMBUD Security <onboarding@resend.dev>';
+  const rawFrom = process.env.EMAIL_FROM?.trim() || '';
+  const hasCustomResendDomain = Boolean(rawFrom && !/onboarding@resend\.dev/i.test(rawFrom));
+  const resendFrom = rawFrom || 'GYMBUD Security <onboarding@resend.dev>';
   const resendKey = process.env.RESEND_API_KEY?.trim();
+  const smtpCfg = getSmtpConfig();
   const webhookUrl = process.env.EMAIL_WEBHOOK_URL?.trim();
+  const failures: string[] = [];
+  let resendSandboxBlocked = false;
 
-  if (resendKey) {
-    const response = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${resendKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        from,
-        to: [params.to],
+  const tryResend = async (): Promise<EmailSendResult | null> => {
+    if (!resendKey) return null;
+    try {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: resendFrom,
+          to: [params.to],
+          subject,
+          html,
+          text,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (response.ok) {
+        const okData = (await response.json().catch(() => ({}))) as { id?: string };
+        console.info(`[GYMBUD Mailer] Resend sent email id=${okData.id || 'ok'} to=${params.to}`);
+        return { delivered: true, provider: 'resend', subject };
+      }
+      const errBody = await response.text().catch(() => '');
+      console.warn(`[GYMBUD Mailer] Resend rejected (${response.status}) for ${params.to}: ${errBody.slice(0, 220)}`);
+      if (response.status === 403 && errBody.toLowerCase().includes('only send testing emails')) {
+        resendSandboxBlocked = true;
+        failures.push(
+          'Resend testing sender (onboarding@resend.dev) can only email the Resend account owner unless EMAIL_FROM uses a verified domain'
+        );
+      } else {
+        failures.push(`Resend (${response.status}): ${errBody.slice(0, 140)}`);
+      }
+    } catch (err: any) {
+      console.warn('[GYMBUD Mailer] Resend request error:', err?.message || err);
+      failures.push(`Resend network error: ${err?.message || 'timeout'}`);
+    }
+    return null;
+  };
+
+  const trySmtp = async (): Promise<EmailSendResult | null> => {
+    if (!smtpCfg) return null;
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtpCfg.host,
+        port: smtpCfg.port,
+        secure: smtpCfg.secure,
+        auth: {
+          user: smtpCfg.user,
+          pass: smtpCfg.pass,
+        },
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+      });
+      const smtpFrom = rawFrom && !/onboarding@resend\.dev/i.test(rawFrom)
+        ? rawFrom
+        : `GYMBUD Security <${smtpCfg.user}>`;
+      const info = await transporter.sendMail({
+        from: smtpFrom,
+        to: params.to,
         subject,
         html,
         text,
-      }),
-    });
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => '');
-      throw new Error(`Email delivery failed (${response.status}): ${errBody.slice(0, 180)}`);
+      });
+      console.info(`[GYMBUD Mailer] SMTP sent email messageId=${info.messageId || 'ok'} to=${params.to}`);
+      return { delivered: true, provider: 'smtp', subject };
+    } catch (err: any) {
+      console.warn('[GYMBUD Mailer] SMTP delivery error:', err?.message || err);
+      failures.push(`SMTP error: ${err?.message || 'delivery failed'}`);
+      return null;
     }
-    return { delivered: true, provider: 'resend', subject };
+  };
+
+  // Prefer verified custom Resend domain, otherwise prefer SMTP (delivers 6-digit code to ANY recipient email)
+  if (hasCustomResendDomain) {
+    const r = await tryResend();
+    if (r) return r;
+  }
+
+  const smtpResult = await trySmtp();
+  if (smtpResult) return smtpResult;
+
+  if (!hasCustomResendDomain) {
+    const r = await tryResend();
+    if (r) return r;
   }
 
   if (webhookUrl) {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: params.to, subject, html, text }),
-    });
-    if (!response.ok) {
-      throw new Error(`Email webhook delivery failed (${response.status})`);
+    try {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: resendFrom,
+          to: params.to,
+          subject,
+          html,
+          text,
+          code: params.code,
+          reset_url: params.resetUrl,
+        }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (response.ok) {
+        return { delivered: true, provider: 'webhook', subject };
+      }
+      failures.push(`Webhook delivery failed (${response.status})`);
+    } catch (err: any) {
+      failures.push(`Webhook error: ${err?.message || 'network error'}`);
     }
-    return { delivered: true, provider: 'webhook', subject };
   }
 
   if (isSupabaseConfigured()) {
     const redirectOrigin = params.redirectTo || params.resetUrl.split('?')[0];
     const sbResult = await sendSupabaseRecoveryEmail(params.to, redirectOrigin);
     if (sbResult.delivered) {
-      return { delivered: true, provider: 'supabase', subject };
+      console.info(`[GYMBUD Mailer] Supabase recovery email triggered for ${params.to}`);
+      return {
+        delivered: true,
+        provider: 'supabase',
+        subject,
+        ...(resendSandboxBlocked
+          ? {
+              fallback_reason:
+                'Resend is in testing mode (onboarding@resend.dev), so recovery was routed via Supabase Auth link email.',
+            }
+          : {}),
+      };
     }
     if (sbResult.rateLimited) {
-      throw new Error('Recovery email rate limit reached. Wait a moment before requesting another email (or add RESEND_API_KEY).');
+      failures.push(
+        'Recovery email rate limit reached (Supabase allows 2 emails/hr on default SMTP). Wait briefly, configure SMTP_* / verified Resend EMAIL_FROM, or ask an Admin to update your password.'
+      );
+    } else {
+      failures.push(sbResult.error || 'Supabase recovery email delivery failed.');
     }
-    throw new Error(sbResult.error || 'Supabase recovery email delivery failed.');
+  }
+
+  if (failures.length > 0) {
+    throw new Error(failures.join(' · '));
   }
 
   console.info(
