@@ -35,6 +35,11 @@ import {
   signInSupabaseAuth,
   updateSupabaseAuthUser,
   uploadImageToSupabaseStorage,
+  listSupabaseUsers,
+  findSupabaseUserByEmail,
+  verifySupabaseJwt,
+  getSupabaseUserByAccessToken,
+  type SupabaseAuthUserRecord,
 } from './supabase.ts';
 import { DEFAULT_COMMUNITY_GUIDELINES } from '../src/shared/constants.ts';
 
@@ -45,7 +50,82 @@ if (!fs.existsSync(uploadsDir)) {
 
 export interface RealtimeHub {
   sendToUser: (userId: string, event: string, payload: unknown) => void;
+  broadcast: (event: string, payload: unknown) => void;
   isUserOnline: (userId: string) => boolean;
+}
+
+function hydrateUserFromSupabaseRecord(sbUser: SupabaseAuthUserRecord): string | null {
+  const email = (sbUser.email || '').trim().toLowerCase();
+  if (!email) return null;
+  const existing = db.prepare(`SELECT id FROM users WHERE email = ?`).get(email) as { id: string } | undefined;
+  if (existing) return existing.id;
+
+  const meta = sbUser.user_metadata || {};
+  const ownerAdminEmail = (process.env.ADMIN_OWNER_EMAIL || 'yusufaguilar2008@gmail.com').trim().toLowerCase();
+  const role: 'member' | 'admin' = email === ownerAdminEmail ? 'admin' : 'member';
+  const candidateId =
+    typeof meta.gymbud_user_id === 'string' && meta.gymbud_user_id.startsWith('usr_')
+      ? meta.gymbud_user_id
+      : `usr_${crypto.randomBytes(8).toString('hex')}`;
+  const idConflict = db.prepare(`SELECT id FROM users WHERE id = ?`).get(candidateId);
+  const hydratedId = idConflict ? `usr_${crypto.randomBytes(8).toString('hex')}` : candidateId;
+
+  const hydratedAge =
+    Number.isInteger(Number(meta.age)) && Number(meta.age) >= 18 && Number(meta.age) <= 99
+      ? Number(meta.age)
+      : 24;
+  const placeholderHash = hashPassword(crypto.randomBytes(24).toString('base64url'));
+
+  const hydrateTx = db.transaction(() => {
+    db.prepare(
+      `INSERT OR IGNORE INTO users (id, email, phone, password_hash, role, account_status)
+       VALUES (?, ?, ?, ?, ?, 'active')`
+    ).run(hydratedId, email, sanitizeText(meta.phone, 32), placeholderHash, role);
+
+    db.prepare(
+      `INSERT OR IGNORE INTO profiles (user_id, display_name, age, gender, bio, city, country, gym_id, avatar_url, experience_level, privacy_discoverable, onboarding_completed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      hydratedId,
+      sanitizeText(meta.display_name, 80) || email.split('@')[0],
+      hydratedAge,
+      sanitizeText(meta.gender, 40) || 'Prefer not to say',
+      sanitizeText(meta.bio, 500) || '',
+      sanitizeText(meta.city, 60) || 'Abu Dhabi',
+      sanitizeText(meta.country, 60) || 'UAE',
+      typeof meta.gym_id === 'string' && meta.gym_id ? sanitizeText(meta.gym_id, 64) : null,
+      typeof meta.avatar_url === 'string' ? sanitizeText(meta.avatar_url, 400) : '',
+      sanitizeText(meta.experience_level, 40) || 'Intermediate',
+      meta.privacy_discoverable === false ? 0 : 1,
+      meta.onboarding_completed ? 1 : 0
+    );
+
+    db.prepare(`INSERT OR IGNORE INTO fitness_preferences (user_id) VALUES (?)`).run(hydratedId);
+    db.prepare(`INSERT OR IGNORE INTO notification_preferences (user_id) VALUES (?)`).run(hydratedId);
+    if (role === 'admin') {
+      db.prepare(`INSERT OR IGNORE INTO admin_roles (user_id, role_name, granted_by) VALUES (?, 'Owner Admin', 'system')`).run(
+        hydratedId
+      );
+    }
+  });
+  hydrateTx();
+  return hydratedId;
+}
+
+let lastSupabaseDiscoverSync = 0;
+async function syncMissingSupabaseUsersToSqlite(): Promise<void> {
+  if (!isSupabaseConfigured()) return;
+  const now = Date.now();
+  if (now - lastSupabaseDiscoverSync < 4000) return;
+  lastSupabaseDiscoverSync = now;
+  try {
+    const sbUsers = await listSupabaseUsers();
+    for (const sbUser of sbUsers) {
+      hydrateUserFromSupabaseRecord(sbUser);
+    }
+  } catch {
+    // Non-fatal: continue returning SQLite profiles immediately
+  }
 }
 
 async function saveBase64Image(dataUrl: string, prefix: string): Promise<string | null> {
@@ -519,6 +599,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
       const token = signSessionToken(userId, assignedRole);
       setSessionCookie(req, res, token);
+      hub.broadcast('discover:updated', { user_id: userId });
 
       res.status(201).json({ user: getFullCurrentUser(userId), session_token: token });
     } catch (err: any) {
@@ -599,8 +680,18 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
             .get(email) as typeof userRow;
         }
       } else if (userRow && !verifyPassword(password, userRow.password_hash)) {
-        res.status(401).json({ error: 'Invalid email or password.' });
-        return;
+        if (isSupabaseConfigured()) {
+          const sbUser = await signInSupabaseAuth(email, password);
+          if (sbUser) {
+            db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashPassword(password), userRow.id);
+          } else {
+            res.status(401).json({ error: 'Invalid email or password.' });
+            return;
+          }
+        } else {
+          res.status(401).json({ error: 'Invalid email or password.' });
+          return;
+        }
       }
 
       if (!userRow) {
@@ -655,7 +746,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     const genericMessage =
       'If an account with that email exists, a secure password reset email has been sent with a reset link and 6-digit code.';
 
-    const userRow = db
+    let userRow = db
       .prepare(
         `SELECT u.id, u.email, u.account_status, p.display_name
          FROM users u
@@ -664,9 +755,43 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       )
       .get(email) as { id: string; email: string; account_status: string; display_name: string | null } | undefined;
 
+    if (!userRow && isSupabaseConfigured()) {
+      const sbUser = await findSupabaseUserByEmail(email);
+      if (sbUser) {
+        hydrateUserFromSupabaseRecord(sbUser);
+        userRow = db
+          .prepare(
+            `SELECT u.id, u.email, u.account_status, p.display_name
+             FROM users u
+             LEFT JOIN profiles p ON p.user_id = u.id
+             WHERE u.email = ?`
+          )
+          .get(email) as typeof userRow;
+      }
+    }
+
     if (!userRow || userRow.account_status !== 'active') {
       res.json({ sent: true, mail_configured: mailConfigured, message: genericMessage });
       return;
+    }
+
+    const usingSupabaseDelivery =
+      isSupabaseConfigured() &&
+      !process.env.RESEND_API_KEY?.trim() &&
+      !process.env.EMAIL_WEBHOOK_URL?.trim();
+
+    if (usingSupabaseDelivery) {
+      const existingSb = await findSupabaseUserByEmail(userRow.email);
+      if (!existingSb) {
+        await provisionSupabaseAuthUser({
+          email: userRow.email,
+          password: crypto.randomBytes(24).toString('base64url'),
+          metadata: {
+            gymbud_user_id: userRow.id,
+            display_name: userRow.display_name || 'Athlete',
+          },
+        });
+      }
     }
 
     const rawToken = crypto.randomBytes(32).toString('base64url');
@@ -679,12 +804,12 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
     const tx = db.transaction(() => {
       db.prepare(`UPDATE password_reset_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(
-        userRow.id
+        userRow!.id
       );
       db.prepare(
         `INSERT INTO password_reset_tokens (id, user_id, token_hash, code_hash, expires_at)
          VALUES (?, ?, ?, ?, ?)`
-      ).run(tokenId, userRow.id, tokenHash, codeHash, expiresAt);
+      ).run(tokenId, userRow!.id, tokenHash, codeHash, expiresAt);
     });
     tx();
 
@@ -701,6 +826,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
         to: userRow.email,
         displayName: userRow.display_name || 'Athlete',
         resetUrl,
+        redirectTo: baseUrl,
         code: resetCode,
         expiresMinutes,
       });
@@ -718,19 +844,63 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       res.json({
         sent: true,
         mail_configured: mailConfigured,
-        message: genericMessage,
+        delivery_provider: emailResult.provider,
+        message:
+          emailResult.provider === 'supabase'
+            ? 'Recovery email sent! Open your inbox (and spam folder) and click the reset link to set a new password.'
+            : genericMessage,
         ...(isDevSandbox && emailResult.preview ? { dev_mail_preview: emailResult.preview } : {}),
       });
     } catch (err: any) {
-      console.error('[Password Reset Email Error]', err?.message || err);
-      res.status(502).json({ error: 'Unable to dispatch reset email right now. Please try again shortly.' });
+      const msg = String(err?.message || '');
+      console.error('[Password Reset Email Error]', msg || err);
+      const isRateLimit = msg.toLowerCase().includes('rate limit');
+      res.status(isRateLimit ? 429 : 502).json({
+        error: msg || 'Unable to dispatch reset email right now. Please try again shortly.',
+      });
     }
   });
 
-  app.post('/api/auth/verify-reset-token', rateLimit('auth_verify_token', 15, 60_000), (req, res) => {
+  app.post('/api/auth/verify-reset-token', rateLimit('auth_verify_token', 15, 60_000), async (req, res) => {
     const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     if (!rawToken || rawToken.length < 16) {
       res.status(400).json({ error: 'Invalid or missing password reset token.' });
+      return;
+    }
+
+    if (rawToken.split('.').length === 3 && isSupabaseConfigured()) {
+      const jwtPayload = await verifySupabaseJwt(rawToken);
+      const sbUser = jwtPayload?.email ? null : await getSupabaseUserByAccessToken(rawToken);
+      const verifiedEmail = (jwtPayload?.email || sbUser?.email || '').trim().toLowerCase();
+      if (!verifiedEmail) {
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+        return;
+      }
+
+      let localUser = db
+        .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+        .get(verifiedEmail) as { id: string; email: string; account_status: string } | undefined;
+
+      if (!localUser) {
+        const sbFull = sbUser || (await findSupabaseUserByEmail(verifiedEmail));
+        if (sbFull) {
+          hydrateUserFromSupabaseRecord(sbFull);
+          localUser = db
+            .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+            .get(verifiedEmail) as typeof localUser;
+        }
+      }
+
+      if (!localUser || localUser.account_status !== 'active') {
+        res.status(400).json({ error: 'This password reset link is invalid or account is inactive.' });
+        return;
+      }
+
+      res.json({
+        valid: true,
+        email_masked: maskEmailAddress(verifiedEmail),
+        provider: 'supabase',
+      });
       return;
     }
 
@@ -754,6 +924,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     res.json({
       valid: true,
       email_masked: maskEmailAddress(record.email),
+      provider: 'local',
     });
   });
 
@@ -765,6 +936,60 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
     if (newPassword.length < 8 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword)) {
       res.status(400).json({ error: 'New password must be at least 8 characters and include both letters and numbers.' });
+      return;
+    }
+
+    if (rawToken && rawToken.split('.').length === 3 && isSupabaseConfigured()) {
+      const jwtPayload = await verifySupabaseJwt(rawToken);
+      const sbUser = jwtPayload?.email ? null : await getSupabaseUserByAccessToken(rawToken);
+      const verifiedEmail = (jwtPayload?.email || sbUser?.email || '').trim().toLowerCase();
+      if (!verifiedEmail) {
+        res.status(400).json({ error: 'This password reset link is invalid or has expired.' });
+        return;
+      }
+
+      let targetUser = db
+        .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+        .get(verifiedEmail) as { id: string; email: string; account_status: string } | undefined;
+
+      if (!targetUser) {
+        const sbFull = sbUser || (await findSupabaseUserByEmail(verifiedEmail));
+        if (sbFull) {
+          hydrateUserFromSupabaseRecord(sbFull);
+          targetUser = db
+            .prepare(`SELECT id, email, account_status FROM users WHERE email = ?`)
+            .get(verifiedEmail) as typeof targetUser;
+        }
+      }
+
+      if (!targetUser || targetUser.account_status !== 'active') {
+        res.status(400).json({ error: 'Account not found or inactive.' });
+        return;
+      }
+
+      const tx = db.transaction(() => {
+        db.prepare(`UPDATE users SET password_hash = ?, email_code = NULL WHERE id = ?`).run(
+          hashPassword(newPassword),
+          targetUser!.id
+        );
+        db.prepare(`UPDATE password_reset_tokens SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL`).run(
+          targetUser!.id
+        );
+      });
+      tx();
+
+      await updateSupabaseAuthUser({ email: verifiedEmail, password: newPassword });
+
+      createNotification({
+        userId: targetUser.id,
+        type: 'security',
+        title: 'Password Updated',
+        bodySafe: 'Your GYMBUD password was reset successfully. If this was not you, contact safety support immediately.',
+        linkView: 'safety',
+        hub,
+      });
+
+      res.json({ reset: true, message: 'Password updated securely. You can now sign in.' });
       return;
     }
 
@@ -1046,13 +1271,20 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
             display_name: displayName,
             age: Math.floor(age),
             gender,
+            bio,
             city,
             country,
+            gym_id: gymId,
+            avatar_url: avatarUrl,
+            experience_level: experienceLevel,
             phone,
+            privacy_discoverable: privacy.discoverable,
             onboarding_completed: Boolean(onboardingCompleted),
           },
         });
       }
+
+      hub.broadcast('discover:updated', { user_id: userId });
 
       res.json({ user: getFullCurrentUser(userId) });
     } catch (err: any) {
@@ -1195,7 +1427,10 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     res.json({ gyms: rows });
   });
 
-  app.get('/api/discover', requireAuth, (req: AuthenticatedRequest, res) => {
+  app.get('/api/discover', requireAuth, async (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    await syncMissingSupabaseUsersToSqlite();
+
     const viewer = getFullCurrentUser(req.authUser!.id);
     if (!viewer) {
       res.status(404).json({ error: 'User not found' });

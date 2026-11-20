@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, useMotionValue, useTransform } from 'motion/react';
 import { BadgeCheck, Eye, Globe, Heart, LayoutGrid, Layers, MapPin, RotateCcw, SlidersHorizontal, X } from 'lucide-react';
 import { api } from '../lib/api.ts';
@@ -9,11 +9,12 @@ import { ProfileDetailModal } from './ProfileDetailModal.tsx';
 
 interface DiscoverViewProps {
   user: CurrentUser;
+  refreshTick?: number;
   onOpenMessages: () => void;
   onOpenUpgrade: () => void;
 }
 
-export function DiscoverView({ user, onOpenMessages, onOpenUpgrade }: DiscoverViewProps) {
+export function DiscoverView({ user, refreshTick = 0, onOpenMessages, onOpenUpgrade }: DiscoverViewProps) {
   const [profiles, setProfiles] = useState<PublicProfileCard[]>([]);
   const [gyms, setGyms] = useState<Gym[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,32 +35,65 @@ export function DiscoverView({ user, onOpenMessages, onOpenUpgrade }: DiscoverVi
   const [lastSkipped, setLastSkipped] = useState<PublicProfileCard | null>(null);
   const [swipeError, setSwipeError] = useState<string | null>(null);
 
+  const silentInFlightRef = useRef(false);
+  const initialLoadingRef = useRef(true);
+
   const dragX = useMotionValue(0);
   const cardRotate = useTransform(dragX, [-200, 200], [-10, 10]);
   const likeOpacity = useTransform(dragX, [24, 110], [0, 1]);
   const skipOpacity = useTransform(dragX, [-110, -24], [1, 0]);
 
+  const buildDiscoverQuery = useCallback(() => {
+    const params = new URLSearchParams();
+    if (goalFilter) params.set('goal', goalFilter);
+    if (gymFilter) params.set('gym_id', gymFilter);
+    if (timeFilter) params.set('time_of_day', timeFilter);
+    if (expFilter) params.set('experience_level', expFilter);
+    if (exerciseFilter) params.set('exercise', exerciseFilter);
+    if (cityFilter && cityFilter !== 'All') params.set('city', cityFilter);
+    params.set('sort', sortMode);
+    if (includeSwiped) params.set('include_swiped', 'true');
+    return params.toString();
+  }, [goalFilter, gymFilter, timeFilter, expFilter, exerciseFilter, cityFilter, sortMode, includeSwiped]);
+
   const loadProfiles = useCallback(async () => {
+    initialLoadingRef.current = true;
     setLoading(true);
     try {
-      const params = new URLSearchParams();
-      if (goalFilter) params.set('goal', goalFilter);
-      if (gymFilter) params.set('gym_id', gymFilter);
-      if (timeFilter) params.set('time_of_day', timeFilter);
-      if (expFilter) params.set('experience_level', expFilter);
-      if (exerciseFilter) params.set('exercise', exerciseFilter);
-      if (cityFilter && cityFilter !== 'All') params.set('city', cityFilter);
-      params.set('sort', sortMode);
-      if (includeSwiped) params.set('include_swiped', 'true');
-
-      const res = await api<{ profiles: PublicProfileCard[] }>(`/api/discover?${params.toString()}`);
+      const res = await api<{ profiles: PublicProfileCard[] }>(`/api/discover?${buildDiscoverQuery()}`);
       setProfiles(res.profiles);
     } catch {
       setProfiles([]);
     } finally {
+      initialLoadingRef.current = false;
       setLoading(false);
     }
-  }, [goalFilter, gymFilter, timeFilter, expFilter, exerciseFilter, cityFilter, sortMode, includeSwiped]);
+  }, [buildDiscoverQuery]);
+
+  const silentRefreshProfiles = useCallback(async () => {
+    if (initialLoadingRef.current || silentInFlightRef.current) return;
+    silentInFlightRef.current = true;
+    try {
+      const res = await api<{ profiles: PublicProfileCard[] }>(`/api/discover?${buildDiscoverQuery()}`);
+      setProfiles((prev) => {
+        const fingerprint = (list: PublicProfileCard[]) =>
+          list
+            .map(
+              (p) =>
+                `${p.user_id}|${p.compatibility.score}|${p.display_name}|${p.avatar_url}|${p.gym_name || ''}|${p.bio}`
+            )
+            .join(';;');
+        if (fingerprint(prev) === fingerprint(res.profiles)) {
+          return prev;
+        }
+        return res.profiles;
+      });
+    } catch {
+      // Silent background poll keeps existing view on transient network errors
+    } finally {
+      silentInFlightRef.current = false;
+    }
+  }, [buildDiscoverQuery]);
 
   useEffect(() => {
     api<{ gyms: Gym[] }>('/api/gyms').then((res) => setGyms(res.gyms)).catch(() => {});
@@ -68,6 +102,34 @@ export function DiscoverView({ user, onOpenMessages, onOpenUpgrade }: DiscoverVi
   useEffect(() => {
     loadProfiles();
   }, [loadProfiles]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        silentRefreshProfiles();
+      }
+    }, 3000);
+
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'visible') {
+        silentRefreshProfiles();
+      }
+    };
+
+    window.addEventListener('focus', onFocusOrVisible);
+    document.addEventListener('visibilitychange', onFocusOrVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocusOrVisible);
+      document.removeEventListener('visibilitychange', onFocusOrVisible);
+    };
+  }, [silentRefreshProfiles]);
+
+  useEffect(() => {
+    if (refreshTick > 0) {
+      silentRefreshProfiles();
+    }
+  }, [refreshTick, silentRefreshProfiles]);
 
   const handleSwipe = useCallback(async (targetUserId: string, decision: 'like' | 'pass') => {
     setSwipeError(null);

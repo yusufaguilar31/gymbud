@@ -44,6 +44,16 @@ async function startServer() {
         }
       }
     },
+    broadcast(event: string, payload: unknown) {
+      const frame = JSON.stringify({ event, payload });
+      for (const sockets of userSockets.values()) {
+        for (const sock of sockets) {
+          if (sock.readyState === WebSocket.OPEN) {
+            sock.send(frame);
+          }
+        }
+      }
+    },
     isUserOnline(userId: string) {
       const sockets = userSockets.get(userId);
       return Boolean(sockets && sockets.size > 0);

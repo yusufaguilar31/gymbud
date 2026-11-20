@@ -17,6 +17,9 @@ const serverlessHub: RealtimeHub = {
   sendToUser() {
     // Persistent WebSockets are disabled in serverless mode; client polls notifications/messages normally.
   },
+  broadcast() {
+    // Persistent WebSockets are disabled in serverless mode; client polls Discover every few seconds.
+  },
   isUserOnline() {
     return false;
   },

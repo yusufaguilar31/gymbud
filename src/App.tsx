@@ -48,8 +48,10 @@ export default function App() {
   const [publicMode, setPublicMode] = useState<'landing' | 'login' | 'register' | 'reset'>('landing');
   const [initialResetToken, setInitialResetToken] = useState<string | null>(null);
   const [initialResetEmail, setInitialResetEmail] = useState<string | null>(null);
+  const [initialResetError, setInitialResetError] = useState<string | null>(null);
   const [view, setView] = useState<ActiveView>('discover');
   const [activeConvoId, setActiveConvoId] = useState<string | null>(null);
+  const [discoverRefreshTick, setDiscoverRefreshTick] = useState(0);
 
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [unreadMessages, setUnreadMessages] = useState(0);
@@ -79,15 +81,34 @@ export default function App() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const resetTok = params.get('reset_token') || params.get('token');
+    const hashRaw = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+    const hashParams = new URLSearchParams(hashRaw);
+
+    const sbAccessToken = hashParams.get('access_token');
+    const sbType = hashParams.get('type') || params.get('type');
+    const sbError = hashParams.get('error_description') || params.get('error_description');
+
+    const resetTok =
+      (sbType === 'recovery' && sbAccessToken) ? sbAccessToken : (params.get('reset_token') || params.get('token'));
     const resetEm = params.get('email');
+
     if (resetTok) {
       setInitialResetToken(resetTok);
       if (resetEm) setInitialResetEmail(resetEm);
+      setInitialResetError(null);
       setPublicMode('reset');
       params.delete('reset_token');
       params.delete('token');
       params.delete('email');
+      params.delete('type');
+      const remaining = params.toString();
+      window.history.replaceState({}, '', remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname);
+    } else if (sbError && (hashParams.has('error') || params.has('error'))) {
+      setInitialResetError(sbError.replace(/\+/g, ' '));
+      setPublicMode('reset');
+      params.delete('error');
+      params.delete('error_code');
+      params.delete('error_description');
       const remaining = params.toString();
       window.history.replaceState({}, '', remaining ? `${window.location.pathname}?${remaining}` : window.location.pathname);
     }
@@ -150,6 +171,8 @@ export default function App() {
             setUnreadMessages((c) => c + 1);
           } else if (event === 'match:created') {
             refreshMe();
+          } else if (event === 'discover:updated') {
+            setDiscoverRefreshTick((t) => t + 1);
           }
         } catch {
           // Ignore malformed WS frames
@@ -216,14 +239,17 @@ export default function App() {
         initialMode={publicMode === 'landing' ? 'login' : publicMode}
         initialResetToken={initialResetToken}
         initialResetEmail={initialResetEmail}
+        initialResetError={initialResetError}
         onBack={() => {
           setInitialResetToken(null);
           setInitialResetEmail(null);
+          setInitialResetError(null);
           setPublicMode('landing');
         }}
         onAuthenticated={(loggedInUser) => {
           setInitialResetToken(null);
           setInitialResetEmail(null);
+          setInitialResetError(null);
           setPublicMode('landing');
           setUser(loggedInUser);
           setView(loggedInUser.role === 'admin' ? 'admin' : 'discover');
@@ -392,6 +418,7 @@ export default function App() {
           {view === 'discover' && (
             <DiscoverView
               user={user}
+              refreshTick={discoverRefreshTick}
               onOpenMessages={() => navigateTo('messages')}
               onOpenUpgrade={() => navigateTo('billing')}
             />

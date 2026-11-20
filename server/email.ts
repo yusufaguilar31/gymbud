@@ -1,14 +1,17 @@
+import { isSupabaseConfigured, sendSupabaseRecoveryEmail } from './supabase.ts';
+
 export interface PasswordResetEmailParams {
   to: string;
   displayName: string;
   resetUrl: string;
+  redirectTo?: string;
   code: string;
   expiresMinutes: number;
 }
 
 export interface EmailSendResult {
   delivered: boolean;
-  provider: 'resend' | 'webhook' | 'sandbox';
+  provider: 'resend' | 'webhook' | 'supabase' | 'sandbox';
   subject: string;
   preview?: {
     to: string;
@@ -20,7 +23,11 @@ export interface EmailSendResult {
 }
 
 export function isEmailDeliveryConfigured(): boolean {
-  return Boolean(process.env.RESEND_API_KEY?.trim() || process.env.EMAIL_WEBHOOK_URL?.trim());
+  return Boolean(
+    process.env.RESEND_API_KEY?.trim() ||
+    process.env.EMAIL_WEBHOOK_URL?.trim() ||
+    isSupabaseConfigured()
+  );
 }
 
 function escapeHtml(value: string): string {
@@ -114,6 +121,18 @@ export async function sendPasswordResetEmail(params: PasswordResetEmailParams): 
       throw new Error(`Email webhook delivery failed (${response.status})`);
     }
     return { delivered: true, provider: 'webhook', subject };
+  }
+
+  if (isSupabaseConfigured()) {
+    const redirectOrigin = params.redirectTo || params.resetUrl.split('?')[0];
+    const sbResult = await sendSupabaseRecoveryEmail(params.to, redirectOrigin);
+    if (sbResult.delivered) {
+      return { delivered: true, provider: 'supabase', subject };
+    }
+    if (sbResult.rateLimited) {
+      throw new Error('Recovery email rate limit reached. Wait a moment before requesting another email (or add RESEND_API_KEY).');
+    }
+    throw new Error(sbResult.error || 'Supabase recovery email delivery failed.');
   }
 
   console.info(

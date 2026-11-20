@@ -93,20 +93,80 @@ export interface SupabaseAuthUserRecord {
   user_metadata?: Record<string, any>;
 }
 
-export async function findSupabaseUserByEmail(email: string): Promise<SupabaseAuthUserRecord | null> {
+export async function listSupabaseUsers(): Promise<SupabaseAuthUserRecord[]> {
   const cfg = getSupabaseConfig();
-  if (!cfg) return null;
+  if (!cfg) return [];
   try {
     const res = await fetch(
-      `${cfg.url}/auth/v1/admin/users?page=1&per_page=50`,
+      `${cfg.url}/auth/v1/admin/users?page=1&per_page=200`,
       { headers: adminHeaders(cfg), signal: AbortSignal.timeout(5000) }
     );
-    if (!res.ok) return null;
+    if (!res.ok) return [];
     const data = (await res.json()) as { users?: SupabaseAuthUserRecord[] };
-    const clean = email.trim().toLowerCase();
-    return (data.users || []).find((u) => (u.email || '').toLowerCase() === clean) || null;
+    return Array.isArray(data.users) ? data.users : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function findSupabaseUserByEmail(email: string): Promise<SupabaseAuthUserRecord | null> {
+  const clean = email.trim().toLowerCase();
+  const users = await listSupabaseUsers();
+  return users.find((u) => (u.email || '').toLowerCase() === clean) || null;
+}
+
+export async function getSupabaseUserByAccessToken(accessToken: string): Promise<SupabaseAuthUserRecord | null> {
+  const cfg = getSupabaseConfig();
+  if (!cfg || !cfg.publishableKey) return null;
+  try {
+    const res = await fetch(`${cfg.url}/auth/v1/user`, {
+      headers: {
+        apikey: cfg.publishableKey,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as SupabaseAuthUserRecord;
+    return data?.email ? data : null;
   } catch {
     return null;
+  }
+}
+
+export async function sendSupabaseRecoveryEmail(
+  email: string,
+  redirectTo: string
+): Promise<{ delivered: boolean; rateLimited?: boolean; error?: string }> {
+  const cfg = getSupabaseConfig();
+  if (!cfg || !cfg.publishableKey) {
+    return { delivered: false, error: 'Supabase publishable key not configured.' };
+  }
+  try {
+    const url = `${cfg.url}/auth/v1/recover?redirect_to=${encodeURIComponent(redirectTo)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        apikey: cfg.publishableKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: email.trim().toLowerCase(),
+        redirect_to: redirectTo,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      return { delivered: true };
+    }
+    const errBody = await res.json().catch(() => ({})) as { msg?: string; message?: string; error_description?: string };
+    const msg = errBody.msg || errBody.message || errBody.error_description || `HTTP ${res.status}`;
+    if (res.status === 429) {
+      return { delivered: false, rateLimited: true, error: msg };
+    }
+    return { delivered: false, error: msg };
+  } catch (err: any) {
+    return { delivered: false, error: err?.message || 'Network error calling Supabase recovery endpoint.' };
   }
 }
 
