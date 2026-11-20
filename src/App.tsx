@@ -114,16 +114,29 @@ export default function App() {
 
     const currentUserId = user.id;
     let cancelled = false;
+    let failedAttempts = 0;
+
     function connect() {
       if (cancelled) return;
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const apiBase = ((import.meta as any).env?.VITE_API_BASE_URL || '').trim();
+      let wsOrigin: string;
+      if (apiBase && /^https?:\/\//i.test(apiBase)) {
+        const parsed = new URL(apiBase);
+        wsOrigin = `${parsed.protocol === 'https:' ? 'wss:' : 'ws:'}//${parsed.host}`;
+      } else {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsOrigin = `${proto}//${window.location.host}`;
+      }
       const token = getSessionToken();
       const wsUrl = token
-        ? `${proto}//${window.location.host}/ws?token=${encodeURIComponent(token)}`
-        : `${proto}//${window.location.host}/ws`;
+        ? `${wsOrigin}/ws?token=${encodeURIComponent(token)}`
+        : `${wsOrigin}/ws`;
       const sock = new WebSocket(wsUrl);
+      let opened = false;
 
       sock.onopen = () => {
+        opened = true;
+        failedAttempts = 0;
         if (!cancelled) setWsSocket(sock);
       };
 
@@ -146,7 +159,11 @@ export default function App() {
       sock.onclose = () => {
         if (!cancelled) {
           setWsSocket(null);
-          reconnectTimerRef.current = window.setTimeout(connect, 2500);
+          if (!opened) {
+            failedAttempts += 1;
+            if (failedAttempts >= 3) return;
+          }
+          reconnectTimerRef.current = window.setTimeout(connect, opened ? 2500 : 5000);
         }
       };
     }

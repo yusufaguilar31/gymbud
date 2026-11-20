@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import express, { type Express } from 'express';
-import { db } from './db.ts';
+import { db, getDataDir } from './db.ts';
 import {
   type AuthenticatedRequest,
   hashPassword,
@@ -30,7 +30,7 @@ import {
 import { isEmailDeliveryConfigured, sendPasswordResetEmail } from './email.ts';
 import { DEFAULT_COMMUNITY_GUIDELINES } from '../src/shared/constants.ts';
 
-const uploadsDir = path.resolve(process.cwd(), 'data', 'uploads');
+const uploadsDir = path.join(getDataDir(), 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }

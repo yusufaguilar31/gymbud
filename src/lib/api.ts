@@ -34,6 +34,14 @@ export function clearSessionToken(): void {
   }
 }
 
+const API_BASE_URL = ((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/$/, '');
+
+export function resolveApiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return API_BASE_URL ? `${API_BASE_URL}${normalized}` : normalized;
+}
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) {
@@ -54,7 +62,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const res = await fetch(path, {
+  const res = await fetch(resolveApiUrl(path), {
     ...options,
     credentials: 'include',
     headers,
@@ -66,7 +74,20 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     try {
       data = JSON.parse(text);
     } catch {
-      data = { error: text };
+      const trimmed = text.trim();
+      const isHtmlOrEdgeNotFound =
+        trimmed.startsWith('<!') ||
+        trimmed.startsWith('<html') ||
+        trimmed.includes('NOT_FOUND') ||
+        trimmed.includes('The page could not be found');
+      data = {
+        error:
+          res.status === 404 && isHtmlOrEdgeNotFound
+            ? 'API endpoint not found (404). Make sure the backend server or Vercel /api routes are deployed.'
+            : isHtmlOrEdgeNotFound
+              ? `Unexpected server response (${res.status}).`
+              : trimmed,
+      };
     }
   }
 

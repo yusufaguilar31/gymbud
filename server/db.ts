@@ -1,16 +1,44 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-const dataDir = path.resolve(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+let resolvedDataDir: string | null = null;
+let usingEphemeralTmp = false;
+
+export function getDataDir(): string {
+  if (resolvedDataDir) return resolvedDataDir;
+
+  const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+  const preferredDir = process.env.DATA_DIR
+    ? path.resolve(process.env.DATA_DIR)
+    : isServerless
+      ? path.join(os.tmpdir(), 'gymbud-data')
+      : path.resolve(process.cwd(), 'data');
+
+  try {
+    if (!fs.existsSync(preferredDir)) {
+      fs.mkdirSync(preferredDir, { recursive: true });
+    }
+    fs.accessSync(preferredDir, fs.constants.W_OK);
+    resolvedDataDir = preferredDir;
+    usingEphemeralTmp = isServerless && !process.env.DATA_DIR;
+    return resolvedDataDir;
+  } catch {
+    const tmpDir = path.join(os.tmpdir(), 'gymbud-data');
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+    resolvedDataDir = tmpDir;
+    usingEphemeralTmp = true;
+    return resolvedDataDir;
+  }
 }
 
-const dbPath = path.join(dataDir, 'gymbud.db');
+const dbPath = path.join(getDataDir(), 'gymbud.db');
 export const db = new Database(dbPath);
 
-db.pragma('journal_mode = WAL');
+db.pragma(`journal_mode = ${usingEphemeralTmp ? 'DELETE' : 'WAL'}`);
 db.pragma('foreign_keys = ON');
 
 export function initializeDatabase(): void {

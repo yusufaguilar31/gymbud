@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
-import { db } from './db.ts';
+import { db, getDataDir } from './db.ts';
 import type { UserRole, AccountStatus } from '../src/shared/types.ts';
 
 let cachedSecret: string | null = null;
@@ -12,19 +12,32 @@ export function getSessionSecret(): string {
     return envSecret;
   }
   if (cachedSecret) return cachedSecret;
-  const secretFile = path.resolve(process.cwd(), 'data', '.session_secret');
-  if (fs.existsSync(secretFile)) {
-    const stored = fs.readFileSync(secretFile, 'utf8').trim();
-    if (stored.length >= 32) {
-      cachedSecret = stored;
-      return cachedSecret;
+  const secretFile = path.join(getDataDir(), '.session_secret');
+  try {
+    if (fs.existsSync(secretFile)) {
+      const stored = fs.readFileSync(secretFile, 'utf8').trim();
+      if (stored.length >= 32) {
+        cachedSecret = stored;
+        return cachedSecret;
+      }
     }
+    const generated = process.env.VERCEL
+      ? crypto
+          .createHash('sha256')
+          .update(`gymbud:${process.env.VERCEL_PROJECT_ID || process.env.VERCEL_URL || 'vercel-runtime'}`)
+          .digest('hex')
+      : crypto.randomBytes(48).toString('hex');
+    fs.mkdirSync(path.dirname(secretFile), { recursive: true });
+    fs.writeFileSync(secretFile, generated, { mode: 0o600 });
+    cachedSecret = generated;
+    return cachedSecret;
+  } catch {
+    cachedSecret = crypto
+      .createHash('sha256')
+      .update(`gymbud:${process.env.VERCEL_PROJECT_ID || process.env.APP_URL || 'fallback-runtime'}`)
+      .digest('hex');
+    return cachedSecret;
   }
-  const generated = crypto.randomBytes(48).toString('hex');
-  fs.mkdirSync(path.dirname(secretFile), { recursive: true });
-  fs.writeFileSync(secretFile, generated, { mode: 0o600 });
-  cachedSecret = generated;
-  return cachedSecret;
 }
 
 export const SESSION_COOKIE_NAME = 'gymbud_session';
