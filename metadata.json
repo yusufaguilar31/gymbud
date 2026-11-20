@@ -1,0 +1,8 @@
+{
+  "name": "GYMBUD",
+  "description": "Find your fit. Find your people. A fitness social network connecting workout partners and training friends across Abu Dhabi, the UAE, and beyond.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
