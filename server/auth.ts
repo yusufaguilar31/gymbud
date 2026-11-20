@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import type { Request, Response, NextFunction } from 'express';
 import { db, getDataDir } from './db.ts';
+import { verifySupabaseJwt } from './supabase.ts';
 import type { UserRole, AccountStatus } from '../src/shared/types.ts';
 
 let cachedSecret: string | null = null;
@@ -121,24 +122,31 @@ export function isUserPlus(userId: string): boolean {
   return Boolean(sub);
 }
 
-export function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+export async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
   const bearerToken = authHeader.replace(/^Bearer\s+/i, '').trim() || undefined;
   const cookieToken = req.cookies?.[SESSION_COOKIE_NAME] || undefined;
-  const payload = verifySessionToken(bearerToken) || verifySessionToken(cookieToken);
-  if (!payload) {
-    res.status(401).json({ error: 'Authentication required' });
-    return;
-  }
+  let payload = verifySessionToken(bearerToken) || verifySessionToken(cookieToken);
 
-  const userRow = db
-    .prepare(`SELECT id, email, role, account_status FROM users WHERE id = ?`)
-    .get(payload.uid) as
+  let userRow:
     | { id: string; email: string; role: UserRole; account_status: AccountStatus }
     | undefined;
 
+  if (payload) {
+    userRow = db
+      .prepare(`SELECT id, email, role, account_status FROM users WHERE id = ?`)
+      .get(payload.uid) as typeof userRow;
+  } else if (bearerToken && bearerToken.split('.').length === 3) {
+    const sbClaims = await verifySupabaseJwt(bearerToken);
+    if (sbClaims?.email) {
+      userRow = db
+        .prepare(`SELECT id, email, role, account_status FROM users WHERE lower(email) = lower(?)`)
+        .get(sbClaims.email) as typeof userRow;
+    }
+  }
+
   if (!userRow) {
-    res.status(401).json({ error: 'Account no longer exists' });
+    res.status(401).json({ error: payload ? 'Account no longer exists' : 'Authentication required' });
     return;
   }
   if (userRow.account_status === 'suspended' || userRow.account_status === 'banned' || userRow.account_status === 'deleted') {

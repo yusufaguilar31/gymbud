@@ -28,6 +28,14 @@ import {
   verifyWebhookSignature,
 } from './payments.ts';
 import { isEmailDeliveryConfigured, sendPasswordResetEmail } from './email.ts';
+import {
+  isSupabaseConfigured,
+  checkSupabaseTablesReady,
+  provisionSupabaseAuthUser,
+  signInSupabaseAuth,
+  updateSupabaseAuthUser,
+  uploadImageToSupabaseStorage,
+} from './supabase.ts';
 import { DEFAULT_COMMUNITY_GUIDELINES } from '../src/shared/constants.ts';
 
 const uploadsDir = path.join(getDataDir(), 'uploads');
@@ -40,15 +48,22 @@ export interface RealtimeHub {
   isUserOnline: (userId: string) => boolean;
 }
 
-function saveBase64Image(dataUrl: string, prefix: string): string | null {
+async function saveBase64Image(dataUrl: string, prefix: string): Promise<string | null> {
   const match = dataUrl.match(/^data:image\/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)$/);
   if (!match) return null;
   const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+  const contentType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
   const buffer = Buffer.from(match[2], 'base64');
   if (buffer.length > 2 * 1024 * 1024) {
     throw new Error('Image must be smaller than 2 MB');
   }
   const filename = `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+
+  if (isSupabaseConfigured()) {
+    const publicUrl = await uploadImageToSupabaseStorage(buffer, filename, contentType);
+    if (publicUrl) return publicUrl;
+  }
+
   fs.writeFileSync(path.join(uploadsDir, filename), buffer);
   return `/api/uploads/${filename}`;
 }
@@ -190,8 +205,17 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   app.use(express.json({ limit: '4mb' }));
 
   // Health endpoint
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'gymbud-api' });
+  app.get('/api/health', async (_req, res) => {
+    const configured = isSupabaseConfigured();
+    const schemaReady = configured ? await checkSupabaseTablesReady() : false;
+    res.json({
+      ok: true,
+      service: 'gymbud-api',
+      supabase: {
+        configured,
+        schema_ready: schemaReady,
+      },
+    });
   });
 
   // ==========================================
@@ -382,7 +406,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   // ==========================================
   // 1. AUTHENTICATION & REGISTRATION
   // ==========================================
-  app.post('/api/auth/register', rateLimit('auth_register', 10, 60_000), (req, res) => {
+  app.post('/api/auth/register', rateLimit('auth_register', 10, 60_000), async (req, res) => {
     if (!req.body || typeof req.body !== 'object') {
       res.status(400).json({ error: 'Invalid registration payload.' });
       return;
@@ -449,6 +473,28 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     const ownerAdminEmail = (process.env.ADMIN_OWNER_EMAIL || 'yusufaguilar2008@gmail.com').trim().toLowerCase();
     const assignedRole: 'member' | 'admin' = email === ownerAdminEmail ? 'admin' : 'member';
 
+    if (isSupabaseConfigured()) {
+      const sbResult = await provisionSupabaseAuthUser({
+        email,
+        password,
+        metadata: {
+          gymbud_user_id: userId,
+          display_name: displayName,
+          age,
+          gender,
+          city,
+          country,
+          phone,
+          role: assignedRole,
+          onboarding_completed: false,
+        },
+      });
+      if (sbResult.duplicate) {
+        res.status(409).json({ error: 'An account with this email already exists.' });
+        return;
+      }
+    }
+
     try {
       const tx = db.transaction(() => {
         db.prepare(
@@ -486,7 +532,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     }
   });
 
-  app.post('/api/auth/login', rateLimit('auth_login', 20, 60_000), (req, res) => {
+  app.post('/api/auth/login', rateLimit('auth_login', 20, 60_000), async (req, res) => {
     if (!req.body || typeof req.body !== 'object') {
       res.status(400).json({ error: 'Invalid login payload.' });
       return;
@@ -501,11 +547,63 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     }
 
     try {
-      const userRow = db
+      let userRow = db
         .prepare(`SELECT id, password_hash, role, account_status FROM users WHERE email = ?`)
         .get(email) as { id: string; password_hash: string; role: 'member' | 'moderator' | 'admin'; account_status: string } | undefined;
 
-      if (!userRow || !verifyPassword(password, userRow.password_hash)) {
+      if (!userRow && isSupabaseConfigured()) {
+        // Hydrate account from Supabase Auth if missing from local/ephemeral SQLite
+        const sbUser = await signInSupabaseAuth(email, password);
+        if (sbUser) {
+          const meta = sbUser.user_metadata || {};
+          const ownerAdminEmail = (process.env.ADMIN_OWNER_EMAIL || 'yusufaguilar2008@gmail.com').trim().toLowerCase();
+          const role: 'member' | 'admin' = email === ownerAdminEmail ? 'admin' : 'member';
+          const hydratedId = typeof meta.gymbud_user_id === 'string' && meta.gymbud_user_id.startsWith('usr_')
+            ? meta.gymbud_user_id
+            : `usr_${crypto.randomBytes(8).toString('hex')}`;
+          const hydratedAge =
+            Number.isInteger(Number(meta.age)) && Number(meta.age) >= 18 && Number(meta.age) <= 99
+              ? Number(meta.age)
+              : 24;
+          const hydratedHash = hashPassword(password);
+
+          const hydrateTx = db.transaction(() => {
+            db.prepare(
+              `INSERT OR IGNORE INTO users (id, email, phone, password_hash, role, account_status)
+               VALUES (?, ?, ?, ?, ?, 'active')`
+            ).run(hydratedId, email, sanitizeText(meta.phone, 32), hydratedHash, role);
+
+            db.prepare(
+              `INSERT OR IGNORE INTO profiles (user_id, display_name, age, gender, city, country, avatar_url, onboarding_completed)
+               VALUES (?, ?, ?, ?, ?, ?, '', ?)`
+            ).run(
+              hydratedId,
+              sanitizeText(meta.display_name, 80) || email.split('@')[0],
+              hydratedAge,
+              sanitizeText(meta.gender, 40) || 'Prefer not to say',
+              sanitizeText(meta.city, 60) || 'Abu Dhabi',
+              sanitizeText(meta.country, 60) || 'UAE',
+              meta.onboarding_completed ? 1 : 0
+            );
+
+            db.prepare(`INSERT OR IGNORE INTO fitness_preferences (user_id) VALUES (?)`).run(hydratedId);
+            db.prepare(`INSERT OR IGNORE INTO notification_preferences (user_id) VALUES (?)`).run(hydratedId);
+            if (role === 'admin') {
+              db.prepare(`INSERT OR IGNORE INTO admin_roles (user_id, role_name, granted_by) VALUES (?, 'Owner Admin', 'system')`).run(hydratedId);
+            }
+          });
+          hydrateTx();
+
+          userRow = db
+            .prepare(`SELECT id, password_hash, role, account_status FROM users WHERE email = ?`)
+            .get(email) as typeof userRow;
+        }
+      } else if (userRow && !verifyPassword(password, userRow.password_hash)) {
+        res.status(401).json({ error: 'Invalid email or password.' });
+        return;
+      }
+
+      if (!userRow) {
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
       }
@@ -659,7 +757,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     });
   });
 
-  app.post('/api/auth/reset-password', rateLimit('auth_reset', 10, 60_000), (req, res) => {
+  app.post('/api/auth/reset-password', rateLimit('auth_reset', 10, 60_000), async (req, res) => {
     const email = sanitizeText(req.body?.email, 160).toLowerCase();
     const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
     const resetCode = sanitizeText(req.body?.code, 12);
@@ -753,6 +851,13 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     });
     tx();
 
+    if (isSupabaseConfigured()) {
+      const resetUser = db.prepare(`SELECT email FROM users WHERE id = ?`).get(matchedRecord.user_id) as { email: string } | undefined;
+      if (resetUser?.email) {
+        await updateSupabaseAuthUser({ email: resetUser.email, password: newPassword });
+      }
+    }
+
     createNotification({
       userId: matchedRecord.user_id,
       type: 'security',
@@ -795,7 +900,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
   // ==========================================
   // 2. PROFILE & ONBOARDING
   // ==========================================
-  app.put('/api/profile/me', requireAuth, (req: AuthenticatedRequest, res) => {
+  app.put('/api/profile/me', requireAuth, async (req: AuthenticatedRequest, res) => {
     const userId = req.authUser!.id;
     const body = req.body || {};
 
@@ -808,7 +913,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
       let avatarUrl = current.avatar_url;
       if (typeof body.avatar_data === 'string' && body.avatar_data.startsWith('data:image/')) {
-        const saved = saveBase64Image(body.avatar_data, `avatar_${userId}`);
+        const saved = await saveBase64Image(body.avatar_data, `avatar_${userId}`);
         if (saved) avatarUrl = saved;
       } else if (typeof body.avatar_url === 'string') {
         avatarUrl = sanitizeText(body.avatar_url, 400);
@@ -816,15 +921,15 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
 
       let additionalPhotos = current.additional_photos;
       if (Array.isArray(body.additional_photos)) {
-        additionalPhotos = body.additional_photos
-          .slice(0, 5)
-          .map((item: unknown) => {
+        const uploaded = await Promise.all(
+          body.additional_photos.slice(0, 5).map(async (item: unknown) => {
             if (typeof item === 'string' && item.startsWith('data:image/')) {
-              return saveBase64Image(item, `photo_${userId}`) || '';
+              return (await saveBase64Image(item, `photo_${userId}`)) || '';
             }
             return typeof item === 'string' ? sanitizeText(item, 400) : '';
           })
-          .filter(Boolean);
+        );
+        additionalPhotos = uploaded.filter(Boolean);
       }
 
       const age = body.age !== undefined ? Number(body.age) : current.age;
@@ -934,6 +1039,21 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
       });
       tx();
 
+      if (isSupabaseConfigured()) {
+        await updateSupabaseAuthUser({
+          email: current.email,
+          metadata: {
+            display_name: displayName,
+            age: Math.floor(age),
+            gender,
+            city,
+            country,
+            phone,
+            onboarding_completed: Boolean(onboardingCompleted),
+          },
+        });
+      }
+
       res.json({ user: getFullCurrentUser(userId) });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || 'Unable to update profile.' });
@@ -1025,7 +1145,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     res.json({ user: updated });
   });
 
-  app.post('/api/verification/selfie', requireAuth, (req: AuthenticatedRequest, res) => {
+  app.post('/api/verification/selfie', requireAuth, async (req: AuthenticatedRequest, res) => {
     const userId = req.authUser!.id;
     const selfieData = typeof req.body?.selfie_data === 'string' ? req.body.selfie_data : '';
     const poseNote = sanitizeText(req.body?.pose_note, 120) || 'GYMBUD pose check';
@@ -1033,7 +1153,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     let artifactRef = `selfie_submission_${poseNote}`;
     try {
       if (selfieData.startsWith('data:image/')) {
-        artifactRef = saveBase64Image(selfieData, `selfie_${userId}`) || artifactRef;
+        artifactRef = (await saveBase64Image(selfieData, `selfie_${userId}`)) || artifactRef;
       }
     } catch (e: any) {
       res.status(400).json({ error: e.message });
@@ -1858,7 +1978,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     res.json({ posts });
   });
 
-  app.post('/api/community/posts', requireAuth, rateLimit('post_create', 15, 60_000), (req: AuthenticatedRequest, res) => {
+  app.post('/api/community/posts', requireAuth, rateLimit('post_create', 15, 60_000), async (req: AuthenticatedRequest, res) => {
     const userId = req.authUser!.id;
     const title = sanitizeText(req.body?.title, 140);
     const body = sanitizeText(req.body?.body, 2000);
@@ -1873,7 +1993,7 @@ export function registerRoutes(app: Express, hub: RealtimeHub): void {
     let imageUrl: string | null = null;
     try {
       if (typeof req.body?.image_data === 'string' && req.body.image_data.startsWith('data:image/')) {
-        imageUrl = saveBase64Image(req.body.image_data, `post_${userId}`);
+        imageUrl = await saveBase64Image(req.body.image_data, `post_${userId}`);
       }
     } catch (e: any) {
       res.status(400).json({ error: e.message });

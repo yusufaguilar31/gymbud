@@ -41,5 +41,15 @@ function ensureInitialized(): void {
 
 export default function handler(req: express.Request, res: express.Response) {
   ensureInitialized();
+
+  const parsed = new URL(req.url || '/api', 'http://localhost');
+  const rewrittenPath = parsed.searchParams.get('__path');
+  if (rewrittenPath !== null) {
+    parsed.searchParams.delete('__path');
+    const qs = parsed.searchParams.toString();
+    const cleanSub = rewrittenPath.replace(/^\/+/, '');
+    req.url = cleanSub ? `/api/${cleanSub}${qs ? `?${qs}` : ''}` : `/api${qs ? `?${qs}` : ''}`;
+  }
+
   return app(req, res);
 }
